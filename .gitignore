@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
+
+# MATLAB temp
+*.asv
+
+# Cursor / VSCode
+.vscode/
+.cursor/
+
+# Build folders
+build/
+
+# S-Tools
+s-tools/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Optional generated outputs
+generated_outputs/
+temp/
+
+# Cloned repos
+Implementations/AudioStego/
+Implementations/Image-in-Audio-Steganography/
+Implementations/audio-steganography-algorithms/
+Implementations/vcpkg/
