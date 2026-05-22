@@ -154,26 +154,60 @@ def extract_message(
 
 
 # ---------------------------------------------------------------------------
-# Example usage
+# Example usage + baseline experiment
 # ---------------------------------------------------------------------------
+
+def run_baseline_experiment(
+    cover_path: Path,
+    stego_path: Path,
+    message: str,
+    password: str = "mypassword123",
+    plot_dir: Path | None = None,
+) -> None:
+    """Embed/extract with timing, BER, plots, and printed analysis notes."""
+    import soundfile as sf
+
+    from stego_analysis import (
+        print_analysis_report,
+        print_ber,
+        print_runtime,
+        run_baseline_visualization,
+        time_embed_extract,
+    )
+
+    plot_dir = plot_dir or Path(__file__).resolve().parent / "audio_out" / "analysis" / "lsb"
+
+    embed_sec, extract_sec, _, recovered = time_embed_extract(
+        lambda: embed_message(cover_path, stego_path, message, password),
+        lambda: extract_message(stego_path, password),
+    )
+
+    cover_f, sr = sf.read(cover_path, dtype="float64", always_2d=True)
+    stego_f, _ = sf.read(stego_path, dtype="float64", always_2d=True)
+
+    print("\n=== LSB baseline experiment ===")
+    print("Original message:", message)
+    print("Recovered message:", recovered)
+    print_ber(message, recovered)
+    print_runtime(embed_sec, extract_sec)
+
+    run_baseline_visualization(cover_f, stego_f, sr, "LSB", plot_dir)
+    print_analysis_report("LSB")
+
 
 if __name__ == "__main__":
     import soundfile as sf
 
-    # Paths relative to this script; adjust to your cover WAV
-    root = Path(__file__).resolve().parent.parent / "audio-steganography-algorithms" / "03-LSB-Coding"
-    cover = root / "cover.wav"  # provide a 16-bit mono/stereo WAV
-    stego = root / "cover_stego.wav"
+    out_dir = Path(__file__).resolve().parent / "audio_out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cover_path = out_dir / "lsb_cover.wav"
+    stego_path = out_dir / "lsb_stego.wav"
     password = "mypassword123"
     message = "Text to be hidden"
+    fs = 44100
+    duration = 1.0
+    t = np.arange(int(fs * duration)) / fs
+    tone = (0.4 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+    sf.write(cover_path, tone, fs, subtype="PCM_16")
 
-    if cover.exists():
-        embed_message(cover, stego, message, password)
-        recovered = extract_message(stego, password)
-        print("Retrieved message:", recovered)
-
-        # Optional: load stego with soundfile for playback/analysis (float [-1, 1])
-        audio, sr = sf.read(stego, dtype="float32")
-        print(f"Stego audio: {len(audio)} samples @ {sr} Hz")
-    else:
-        print(f"Place a 16-bit WAV at {cover} to run the example.")
+    run_baseline_experiment(cover_path, stego_path, message, password)

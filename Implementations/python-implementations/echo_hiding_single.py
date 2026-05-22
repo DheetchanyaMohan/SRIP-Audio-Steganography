@@ -287,8 +287,48 @@ def save_audio(path: str | Path, data: np.ndarray, fs: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Example usage
+# Example usage + baseline experiment
 # ---------------------------------------------------------------------------
+
+def run_baseline_experiment(
+    cover: np.ndarray,
+    fs: int,
+    message: str,
+    plot_dir: Path | None = None,
+) -> tuple[np.ndarray, str]:
+    """Embed/extract with timing, BER, plots, and printed analysis notes."""
+    from stego_analysis import (
+        print_analysis_report,
+        print_ber,
+        print_runtime,
+        run_baseline_visualization,
+        time_embed_extract,
+    )
+
+    plot_dir = plot_dir or Path(__file__).resolve().parent / "audio_out" / "analysis" / "echo"
+    state: dict = {}
+
+    def _embed():
+        state["stego"] = embed_message(cover.copy(), message)
+        return state["stego"]
+
+    def _extract():
+        return extract_message(state["stego"], len_msg=len(message))
+
+    embed_sec, extract_sec, _, recovered = time_embed_extract(_embed, _extract)
+    stego = state["stego"]
+
+    print("\n=== Echo Hiding baseline experiment ===")
+    print("Original :", message)
+    print("Recovered:", recovered)
+    print_ber(message, recovered, to_bits=get_bits)
+    print(f"NC: {nc(message, recovered):.4f}")
+    print_runtime(embed_sec, extract_sec)
+
+    run_baseline_visualization(cover, stego, fs, "Echo Hiding", plot_dir)
+    print_analysis_report("Echo Hiding")
+    return stego, recovered
+
 
 if __name__ == "__main__":
     root = (
@@ -300,7 +340,6 @@ if __name__ == "__main__":
     text_path = root / "text.txt"
     message = text_path.read_text(encoding="utf-8").strip() if text_path.exists() else "Text to be hidden"
 
-    # Synthetic cover: need at least (8 * len(message)) frames of length L
     fs = 44100
     L = DEFAULT_FRAME_LEN
     n_frames = max(8 * len(message) + 8, 200)
@@ -308,14 +347,7 @@ if __name__ == "__main__":
     rng = np.random.default_rng(42)
     cover = rng.standard_normal((n_samples, 1))
 
-    stego = embed_message(cover, message)
-    recovered = extract_message(stego, len_msg=len(message))
-
-    print("Original :", message)
-    print("Recovered:", recovered)
-    print("BER      :", ber(message, recovered))
-    print("NC       :", nc(message, recovered))
-
+    stego, _ = run_baseline_experiment(cover, fs, message)
     out_dir = Path(__file__).resolve().parent / "audio_out"
     save_audio(out_dir / "demo_stego.wav", stego, fs)
     print(f"Wrote {out_dir / 'demo_stego.wav'}")

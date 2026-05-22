@@ -210,37 +210,71 @@ def extract_message(
 
 
 # ---------------------------------------------------------------------------
-# Example usage
+# Example usage + baseline experiment
 # ---------------------------------------------------------------------------
+
+def run_baseline_experiment(
+    cover: np.ndarray,
+    fs: int,
+    message: str,
+    frame_len: int = DEFAULT_FRAME_LEN,
+    quefrency: int = DEFAULT_QUEFRENCY,
+    strength: float = DEFAULT_STRENGTH,
+    plot_dir: Path | None = None,
+) -> tuple[np.ndarray, str]:
+    """Embed/extract with timing, BER, plots, and printed analysis notes."""
+    from stego_analysis import (
+        print_analysis_report,
+        print_ber,
+        print_runtime,
+        run_baseline_visualization,
+        time_embed_extract,
+    )
+
+    plot_dir = plot_dir or Path(__file__).resolve().parent / "audio_out" / "analysis" / "cepstrum"
+    n_bits = len(text_to_bits(message))
+    state: dict = {}
+
+    def _embed():
+        stego = embed_message(cover.copy(), message, frame_len, quefrency, strength)
+        state["stego"] = stego
+        return stego
+
+    def _extract():
+        return extract_message(
+            state["stego"], frame_len, quefrency, n_bits=n_bits
+        )
+
+    embed_sec, extract_sec, _, recovered = time_embed_extract(_embed, _extract)
+    stego = state["stego"]
+
+    print("\n=== Cepstrum baseline experiment ===")
+    print("Original :", message)
+    print("Recovered:", recovered)
+    print(f"Match    : {message == recovered}")
+    print(f"Frames used: {n_bits} (frame_len={frame_len})")
+    print_ber(message, recovered, to_bits=text_to_bits)
+    print_runtime(embed_sec, extract_sec)
+
+    run_baseline_visualization(cover, stego, fs, "Cepstrum", plot_dir)
+    print_analysis_report("Cepstrum")
+    return stego, recovered
+
 
 if __name__ == "__main__":
     fs = 44100
-    duration = 6.0  # need len(bits) * frame_len samples (112 * 2048 / 44100 ≈ 5.2 s)
+    duration = 6.0
     n = int(fs * duration)
     t = np.arange(n) / fs
     rng = np.random.default_rng(0)
-
-    # Cover: tonal + noise (cepstrum peaks away from DC are easy to nudge)
     cover = (
         0.4 * np.sin(2 * np.pi * 440 * t)
         + 0.1 * np.sin(2 * np.pi * 880 * t)
         + 0.02 * rng.standard_normal(n)
     )[:, np.newaxis]
-
     message = "Hello cepstrum"
-    frame_len = DEFAULT_FRAME_LEN
-    quefrency = DEFAULT_QUEFRENCY
-    strength = DEFAULT_STRENGTH
 
-    stego = embed_message(cover, message, frame_len, quefrency, strength)
-    n_bits = len(text_to_bits(message))
-    recovered = extract_message(stego, frame_len, quefrency, n_bits=n_bits)
-
-    print("Original :", message)
-    print("Recovered:", recovered)
-    print("Match    :", message == recovered)
-    print(f"Frames used: {len(text_to_bits(message))} (frame_len={frame_len})")
-
+    stego, _ = run_baseline_experiment(cover, fs, message)
     out_path = Path(__file__).resolve().parent / "audio_out" / "cepstrum_stego.wav"
     save_audio(out_path, stego, fs)
     print(f"Wrote {out_path}")

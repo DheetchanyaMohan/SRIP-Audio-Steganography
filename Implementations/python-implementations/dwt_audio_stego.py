@@ -272,34 +272,71 @@ def save_audio(path: str | Path, data: np.ndarray, fs: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Example usage
+# Example usage + baseline experiment
 # ---------------------------------------------------------------------------
+
+def run_baseline_experiment(
+    cover: np.ndarray,
+    fs: int,
+    message: str,
+    n_samples: int = 65536,
+    n_embedded: int = 8192,
+    plot_dir: Path | None = None,
+) -> tuple[np.ndarray, str]:
+    """Embed/extract with timing, BER, plots, and printed analysis notes."""
+    from stego_analysis import (
+        print_analysis_report,
+        print_ber,
+        print_runtime,
+        run_baseline_visualization,
+        time_embed_extract,
+    )
+
+    plot_dir = plot_dir or Path(__file__).resolve().parent / "audio_out" / "analysis" / "dwt"
+    payload = text_to_payload(message, n_embedded)
+    scaled = estimate_scale(cover[:, 0] if cover.ndim == 2 else cover, n_samples, n_embedded)
+    state: dict = {}
+
+    def _embed():
+        stego, _, _ = embed_message(cover.copy(), payload, n_samples, n_embedded, scaled)
+        state["stego"] = stego
+        return stego
+
+    def _extract():
+        raw = extract_message(
+            state["stego"], n_samples, n_embedded, scaled, payload_len=n_embedded
+        )
+        n_bytes = len(message.encode("utf-8"))
+        return payload_to_text(raw[:n_bytes])
+
+    embed_sec, extract_sec, _, recovered = time_embed_extract(_embed, _extract)
+    stego = state["stego"]
+
+    print("\n=== DWT baseline experiment ===")
+    print("Original :", message)
+    print("Recovered:", recovered)
+    print(f"scaled   : {scaled:.6f}")
+    print_ber(message, recovered)
+    print_runtime(embed_sec, extract_sec)
+
+    run_baseline_visualization(cover, stego, fs, "DWT", plot_dir)
+    print_analysis_report("DWT")
+    return stego, recovered
+
 
 if __name__ == "__main__":
     fs = 44100
     n_samples = 65536
-    n_embedded = 8192  # finest band length = ceil(n_samples / 2^level), level=3
+    n_embedded = 8192
 
     rng = np.random.default_rng(0)
     t = np.arange(n_samples) / fs
     cover = (0.2 * np.sin(2 * np.pi * 440 * t) + 0.05 * rng.standard_normal(n_samples))[
         :, np.newaxis
     ]
-
     message = "Hidden in wavelet coefficients"
-    payload = text_to_payload(message, n_embedded)
-    scaled = estimate_scale(cover[:, 0], n_samples, n_embedded)
 
-    n_bytes = len(message.encode("utf-8"))
-    stego, _, _ = embed_message(cover, payload, n_samples, n_embedded, scaled)
-    recovered_payload = extract_message(stego, n_samples, n_embedded, scaled, payload_len=n_embedded)
-    recovered = payload_to_text(recovered_payload[:n_bytes])
-
-    print("Original :", message)
-    print("Recovered:", recovered)
-    print("scaled   :", scaled)
-    print("byte RMSE :", np.sqrt(np.mean((payload[: len(message.encode())] - recovered_payload[: len(message.encode())]) ** 2)))
-
+    stego, _ = run_baseline_experiment(cover, fs, message, n_samples, n_embedded)
     out = Path(__file__).resolve().parent / "audio_out" / "dwt_stego.wav"
     save_audio(out, stego, fs)
     print(f"Wrote {out}")
