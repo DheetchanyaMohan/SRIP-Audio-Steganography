@@ -259,6 +259,22 @@ METHOD_NOTES: dict[str, dict[str, str]] = {
             "and overlap-add framing to reduce block edges."
         ),
     },
+    "Autoencoder Latent": {
+        "observations": (
+            "Secrets are embedded as LSBs on a quantized grid in the pretrained "
+            "ArchiSound latent (autoencoder1d-AT-v1, Tanh bottleneck). "
+            "Waveform quality depends on how many latent scalars are flipped."
+        ),
+        "limitations": (
+            "Lossy AE: decode(encode(cover)) != cover and encode(stego) != z_embedded; "
+            "BER rises with payload size and low quant_levels. "
+            "Fixed 48 kHz stereo length (default 2**18 samples)."
+        ),
+        "improvements": (
+            "Spread-spectrum latent indexing, error-correcting codes, "
+            "QIM with calibrated step size, or fine-tuned robust latent stego."
+        ),
+    },
 }
 
 

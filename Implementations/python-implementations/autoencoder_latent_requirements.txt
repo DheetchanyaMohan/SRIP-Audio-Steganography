@@ -1,0 +1,11 @@
+# Latent-space stego (autoencoder_latent_stego.py)
+# ArchiSound autoencoder1d-AT-v1: use transformers 4.x (5.x needs runtime patch in loader)
+numpy>=1.20
+scipy>=1.7
+soundfile>=0.12
+matplotlib>=3.5
+librosa>=0.10
+torch>=1.13
+transformers>=4.44.0,<5.0.0
+huggingface_hub>=0.20.0
+archisound>=0.0.6
