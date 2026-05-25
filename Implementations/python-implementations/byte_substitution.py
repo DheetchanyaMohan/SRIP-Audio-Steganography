@@ -260,6 +260,73 @@ def find_hidden_raw(buffer: bytearray) -> int:
     return find_hidden_wav_pcm(buffer[WAV_HEADER:])
 
 
+def run_baseline_experiment(
+    cover_path: Path,
+    payload_path: Path | None,
+    message: str,
+    stego_path: Path | None = None,
+) -> int:
+    """Spread-spectrum byte hide + extract with BER, quality metrics, and sizes."""
+    import time
+
+    from stego_analysis import (
+        PayloadInfo,
+        load_payload_file,
+        print_audio_quality_metrics,
+        print_ber,
+        print_size_report,
+        resolve_payload,
+        run_baseline_visualization,
+        compute_audio_quality_metrics,
+    )
+
+    stego_path = stego_path or Path("output.wav")
+    pinfo = (
+        load_payload_file(payload_path)
+        if payload_path
+        else resolve_payload(payload_text=message)
+    )
+    payload_bytes = (pinfo.text or "").encode("latin-1", errors="replace") + END_MARKER.encode(
+        "ascii"
+    )
+    if pinfo.raw_bytes and payload_path:
+        payload_bytes = pinfo.raw_bytes + END_MARKER.encode("ascii")
+
+    cover_pcm, sr, subtype = load_wav_pcm_bytes(cover_path)
+    cover_f, _ = sf.read(cover_path, dtype="float64", always_2d=True)
+
+    t0 = time.perf_counter()
+    status = hide_in_wav_pcm(cover_pcm, payload_bytes, "", is_binary=False)
+    embed_sec = time.perf_counter() - t0
+    if status != SUCCESS:
+        return status
+    save_wav_from_pcm(stego_path, cover_pcm, sr, subtype)
+
+    t1 = time.perf_counter()
+    stego_pcm, _, _ = load_wav_pcm_bytes(stego_path)
+    header_bytes, last_pos = read_spread_header(stego_pcm)
+    modulus, _, msg_type = parse_header(header_bytes)
+    data, ok = read_spread_until_marker(stego_pcm, modulus, last_pos)
+    extract_sec = time.perf_counter() - t1
+
+    recovered = data.decode("latin-1", errors="replace") if ok else ""
+    original = (pinfo.text or message).rstrip(END_MARKER)
+
+    print("\n=== Byte substitution baseline experiment ===")
+    print("Original :", original[:80], "..." if len(original) > 80 else "")
+    print("Recovered:", recovered[:80], "..." if len(recovered) > 80 else "")
+    print_ber(original, recovered)
+    print(f"Embedding time:   {embed_sec * 1000:.2f} ms")
+    print(f"Extraction time:  {extract_sec * 1000:.2f} ms")
+
+    stego_f, _ = sf.read(stego_path, dtype="float64", always_2d=True)
+    plot_dir = Path(__file__).resolve().parent / "audio_out" / "analysis" / "byte_substitution"
+    run_baseline_visualization(cover_f, stego_f, sr, "Byte substitution", plot_dir)
+    print_size_report(cover_path=cover_path, stego_path=stego_path, payload=pinfo)
+    print_audio_quality_metrics(compute_audio_quality_metrics(cover_f, stego_f, sr))
+    return SUCCESS
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Audio steganography (Python port)")
     parser.add_argument("input_file", nargs="?", help="Cover or stego audio/file")
@@ -268,6 +335,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs="?",
         help="Text in 'quotes', file to hide, or -f/--find",
     )
+    parser.add_argument(
+        "--experiment",
+        action="store_true",
+        help="Run baseline experiment (metrics + plots) on cover WAV",
+    )
+    parser.add_argument("--payload-file", type=Path, default=None, help="Payload file to hide")
     return parser.parse_args(argv)
 
 
@@ -282,6 +355,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     input_path = Path(args.input_file)
+
+    if args.experiment and input_path.suffix.lower() == ".wav":
+        msg = "Default Message KEKLIFE"
+        if args.message_or_flag and args.message_or_flag not in ("-f", "--find"):
+            msg = args.message_or_flag.strip("'\"")
+        return run_baseline_experiment(
+            input_path,
+            args.payload_file,
+            msg,
+            Path("output.wav"),
+        )
+
     mode = 1  # hide string
 
     if args.message_or_flag is None:

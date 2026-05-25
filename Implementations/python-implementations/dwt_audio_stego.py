@@ -5,6 +5,11 @@ DWT / wavelet audio steganography — Python port of Image-in-Audio-Steganograph
 Embeds a 1D payload in the finest detail subband of a custom detail-only DWT cascade
 (db12). The full project also maps images via ISTFT + 2D permutation (encryption2D.m);
 this module implements the wavelet embed/extract core and optional text/byte helpers.
+
+Byte/text payloads are embedded as normalized coefficients (payload/scaled). Extraction
+re-runs the same cascade on the stego signal, so recovery is approximate (analysis /
+synthesis mismatch), not bit-exact like LSB. Float audio payloads matched to the
+subband are the intended loss-tolerant use case from the original MATLAB flow.
 """
 
 from __future__ import annotations
@@ -99,6 +104,33 @@ def finest_detail_row(level: int) -> int:
 # ---------------------------------------------------------------------------
 # Payload helpers (text / bytes — optional; core MATLAB embeds ISTFT signal x)
 # ---------------------------------------------------------------------------
+
+def bytes_to_payload(data: bytes, n_embedded: int) -> np.ndarray:
+    """Map raw bytes to [0, 1] floats; zero-pad to n_embedded."""
+    raw = data
+    if len(raw) > n_embedded:
+        warnings.warn("Payload truncated to fit n_embedded.")
+        raw = raw[:n_embedded]
+    payload = np.zeros(n_embedded, dtype=np.float64)
+    payload[: len(raw)] = np.frombuffer(raw, dtype=np.uint8) / 255.0
+    return payload
+
+
+def coeffs_to_bytes(payload: np.ndarray, *, nbytes: int | None = None) -> bytes:
+    """Recover bytes from normalized wavelet payload coefficients (lossy decode)."""
+    bytes_arr = np.clip(np.round(payload * 255.0), 0, 255).astype(np.uint8)
+    if nbytes is not None:
+        return bytes(bytes_arr[:nbytes])
+    end = len(bytes_arr)
+    while end > 0 and bytes_arr[end - 1] == 0:
+        end -= 1
+    return bytes(bytes_arr[:end])
+
+
+def payload_to_bytes(payload: np.ndarray, *, nbytes: int | None = None) -> bytes:
+    """Alias for coeffs_to_bytes (wavelet coefficients, not PayloadInfo)."""
+    return coeffs_to_bytes(payload, nbytes=nbytes)
+
 
 def text_to_payload(text: str, n_embedded: int) -> np.ndarray:
     """Map UTF-8 bytes to [0, 1] floats; zero-pad to n_embedded."""
@@ -211,7 +243,10 @@ def extract_message(
     Extract payload from stego audio (decryptionDWT.m).
 
     Re-analyzes the stego with the same cascade and reads the finest detail row.
-    Recovery is approximate if payload statistics differ strongly from the cover band.
+
+    Recovery is approximate: overwriting the finest detail band and reconstructing
+    the waveform does not preserve coefficients under a second analysis pass.
+    Use ``payload_len`` to limit how many coefficients are decoded to bytes.
     """
     if stego.ndim == 2:
         audio = stego[:, 0].astype(np.float64)
@@ -275,25 +310,61 @@ def save_audio(path: str | Path, data: np.ndarray, fs: int) -> None:
 # Example usage + baseline experiment
 # ---------------------------------------------------------------------------
 
+def _payload_from_info(
+    info: object,
+    payload_bytes: bytes,
+    n_embedded: int,
+) -> tuple[np.ndarray, bytes]:
+    """Build float wavelet payload and reference bytes for BER."""
+    from stego_analysis import PayloadInfo
+
+    if isinstance(info, PayloadInfo) and info.kind == "audio" and info.audio is not None:
+        p = info.audio.astype(np.float64)
+        if len(p) > n_embedded:
+            p = p[:n_embedded]
+        else:
+            buf = np.zeros(n_embedded, dtype=np.float64)
+            buf[: len(p)] = p
+            p = buf
+        peak = float(np.max(np.abs(p))) or 1.0
+        p = p / peak
+        ref = payload_bytes[: len(p)] if len(payload_bytes) >= len(p) else payload_bytes
+        return p, ref
+
+    return bytes_to_payload(payload_bytes, n_embedded), payload_bytes
+
+
 def run_baseline_experiment(
     cover: np.ndarray,
     fs: int,
-    message: str,
+    payload_bytes: bytes,
     n_samples: int = 65536,
     n_embedded: int = 8192,
     plot_dir: Path | None = None,
-) -> tuple[np.ndarray, str]:
-    """Embed/extract with timing, BER, plots, and printed analysis notes."""
+    *,
+    cover_path: Path | None = None,
+    stego_path: Path | None = None,
+    payload_info: object | None = None,
+    extracted_path: Path | None = None,
+) -> tuple[np.ndarray, bytes]:
+    """Embed/extract with full evaluation framework."""
     from stego_analysis import (
+        PayloadInfo,
         print_analysis_report,
-        print_ber,
-        print_runtime,
-        run_baseline_visualization,
+        resolve_payload,
+        run_full_baseline_evaluation,
+        suggested_extracted_path,
         time_embed_extract,
     )
 
     plot_dir = plot_dir or Path(__file__).resolve().parent / "audio_out" / "analysis" / "dwt"
-    payload = text_to_payload(message, n_embedded)
+    pinfo = (
+        payload_info
+        if isinstance(payload_info, PayloadInfo)
+        else resolve_payload(payload_text=payload_bytes.decode("utf-8", errors="replace"))
+    )
+    payload, ber_ref = _payload_from_info(pinfo, payload_bytes, n_embedded)
+    n_keep = min(len(ber_ref), len(payload))
     scaled = estimate_scale(cover[:, 0] if cover.ndim == 2 else cover, n_samples, n_embedded)
     state: dict = {}
 
@@ -304,39 +375,89 @@ def run_baseline_experiment(
 
     def _extract():
         raw = extract_message(
-            state["stego"], n_samples, n_embedded, scaled, payload_len=n_embedded
+            state["stego"],
+            n_samples,
+            n_embedded,
+            scaled,
+            payload_len=n_keep,
         )
-        n_bytes = len(message.encode("utf-8"))
-        return payload_to_text(raw[:n_bytes])
+        return coeffs_to_bytes(raw, nbytes=n_keep)
 
     embed_sec, extract_sec, _, recovered = time_embed_extract(_embed, _extract)
     stego = state["stego"]
 
-    print("\n=== DWT baseline experiment ===")
-    print("Original :", message)
-    print("Recovered:", recovered)
-    print(f"scaled   : {scaled:.6f}")
-    print_ber(message, recovered)
-    print_runtime(embed_sec, extract_sec)
+    if stego_path is not None:
+        save_audio(stego_path, stego, fs)
 
-    run_baseline_visualization(cover, stego, fs, "DWT", plot_dir)
+    out_extract = extracted_path or suggested_extracted_path(
+        "DWT", pinfo, Path(__file__).resolve().parent / "audio_out" / "extracted"
+    )
+
+    print("\n=== DWT baseline experiment ===")
+    print(f"scaled: {scaled:.6f}")
+    run_full_baseline_evaluation(
+        "DWT",
+        cover,
+        stego,
+        fs,
+        ber_ref[:n_keep],
+        recovered,
+        embed_sec,
+        extract_sec,
+        plot_dir,
+        cover_path=cover_path,
+        stego_path=stego_path,
+        payload_info=pinfo,
+        extracted_path=out_extract,
+    )
     print_analysis_report("DWT")
     return stego, recovered
 
 
 if __name__ == "__main__":
+    import argparse
+
+    from stego_analysis import (
+        add_experiment_arguments,
+        load_cover_audio,
+        payload_info_to_bytes,
+        resolve_payload,
+    )
+
+    parser = argparse.ArgumentParser(description="DWT wavelet steganography demo")
+    add_experiment_arguments(parser)
+    args = parser.parse_args()
+
     fs = 44100
     n_samples = 65536
     n_embedded = 8192
 
-    rng = np.random.default_rng(0)
-    t = np.arange(n_samples) / fs
-    cover = (0.2 * np.sin(2 * np.pi * 440 * t) + 0.05 * rng.standard_normal(n_samples))[
-        :, np.newaxis
-    ]
-    message = "Hidden in wavelet coefficients"
+    def _synthetic():
+        rng = np.random.default_rng(0)
+        t = np.arange(n_samples) / fs
+        y = 0.2 * np.sin(2 * np.pi * 440 * t) + 0.05 * rng.standard_normal(n_samples)
+        return y[:, np.newaxis], fs
 
-    stego, _ = run_baseline_experiment(cover, fs, message, n_samples, n_embedded)
-    out = Path(__file__).resolve().parent / "audio_out" / "dwt_stego.wav"
-    save_audio(out, stego, fs)
-    print(f"Wrote {out}")
+    cover, fs, cover_path = load_cover_audio(args.cover, synthetic_builder=_synthetic)
+    pinfo = resolve_payload(
+        payload_file=args.payload_file,
+        payload_text=args.payload_text,
+        default_text="Hidden in wavelet coefficients",
+    )
+    payload_bytes = payload_info_to_bytes(pinfo)
+
+    out_dir = Path(__file__).resolve().parent / "audio_out"
+    stego_path = args.stego_out or (out_dir / "dwt_stego.wav")
+
+    stego, _ = run_baseline_experiment(
+        cover,
+        fs,
+        payload_bytes,
+        n_samples,
+        n_embedded,
+        cover_path=cover_path,
+        stego_path=stego_path,
+        payload_info=pinfo,
+        extracted_path=args.extracted_out,
+    )
+    print(f"Wrote {stego_path}")

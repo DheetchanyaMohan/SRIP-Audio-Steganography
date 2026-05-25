@@ -293,19 +293,33 @@ def save_audio(path: str | Path, data: np.ndarray, fs: int) -> None:
 def run_baseline_experiment(
     cover: np.ndarray,
     fs: int,
-    message: str,
+    payload_bytes: bytes,
     plot_dir: Path | None = None,
-) -> tuple[np.ndarray, str]:
-    """Embed/extract with timing, BER, plots, and printed analysis notes."""
+    *,
+    cover_path: Path | None = None,
+    stego_path: Path | None = None,
+    payload_info: object | None = None,
+    extracted_path: Path | None = None,
+) -> tuple[np.ndarray, bytes]:
+    """Embed/extract with full evaluation framework."""
     from stego_analysis import (
+        PayloadInfo,
+        bytes_from_latin1,
+        payload_as_latin1,
         print_analysis_report,
-        print_ber,
-        print_runtime,
-        run_baseline_visualization,
+        resolve_payload,
+        run_full_baseline_evaluation,
+        suggested_extracted_path,
         time_embed_extract,
     )
 
     plot_dir = plot_dir or Path(__file__).resolve().parent / "audio_out" / "analysis" / "echo"
+    pinfo = (
+        payload_info
+        if isinstance(payload_info, PayloadInfo)
+        else resolve_payload(payload_text=payload_bytes.decode("utf-8", errors="replace"))
+    )
+    message = payload_as_latin1(payload_bytes)
     state: dict = {}
 
     def _embed():
@@ -313,41 +327,92 @@ def run_baseline_experiment(
         return state["stego"]
 
     def _extract():
-        return extract_message(state["stego"], len_msg=len(message))
+        text = extract_message(state["stego"], len_msg=len(message))
+        return bytes_from_latin1(text)
 
     embed_sec, extract_sec, _, recovered = time_embed_extract(_embed, _extract)
     stego = state["stego"]
 
-    print("\n=== Echo Hiding baseline experiment ===")
-    print("Original :", message)
-    print("Recovered:", recovered)
-    print_ber(message, recovered, to_bits=get_bits)
-    print(f"NC: {nc(message, recovered):.4f}")
-    print_runtime(embed_sec, extract_sec)
+    if stego_path is not None:
+        save_audio(stego_path, stego, fs)
 
-    run_baseline_visualization(cover, stego, fs, "Echo Hiding", plot_dir)
+    out_extract = extracted_path or suggested_extracted_path(
+        "Echo Hiding", pinfo, Path(__file__).resolve().parent / "audio_out" / "extracted"
+    )
+
+    print("\n=== Echo Hiding baseline experiment ===")
+    rec_text = recovered.decode("utf-8", errors="replace")
+    orig_text = payload_bytes.decode("utf-8", errors="replace")
+    print(f"NC (bit, legacy): {nc(orig_text, rec_text):.4f}")
+    run_full_baseline_evaluation(
+        "Echo Hiding",
+        cover,
+        stego,
+        fs,
+        payload_bytes,
+        recovered,
+        embed_sec,
+        extract_sec,
+        plot_dir,
+        cover_path=cover_path,
+        stego_path=stego_path,
+        payload_info=pinfo,
+        extracted_path=out_extract,
+    )
     print_analysis_report("Echo Hiding")
     return stego, recovered
 
 
 if __name__ == "__main__":
+    import argparse
+
+    from stego_analysis import (
+        add_experiment_arguments,
+        load_cover_audio,
+        payload_to_bytes,
+        resolve_payload,
+    )
+
+    parser = argparse.ArgumentParser(description="Echo hiding steganography demo")
+    add_experiment_arguments(parser)
+    args = parser.parse_args()
+
     root = (
         Path(__file__).resolve().parent.parent
         / "audio-steganography-algorithms"
         / "02-Echo-Hiding"
         / "01-Echo-Hiding-Single-Kernel"
     )
-    text_path = root / "text.txt"
-    message = text_path.read_text(encoding="utf-8").strip() if text_path.exists() else "Text to be hidden"
+    default_msg = (
+        (root / "text.txt").read_text(encoding="utf-8").strip()
+        if (root / "text.txt").exists()
+        else "Text to be hidden"
+    )
+    pinfo = resolve_payload(
+        payload_file=args.payload_file,
+        payload_text=args.payload_text,
+        default_text=default_msg,
+    )
+    payload_bytes = payload_to_bytes(pinfo)
 
-    fs = 44100
-    L = DEFAULT_FRAME_LEN
-    n_frames = max(8 * len(message) + 8, 200)
-    n_samples = n_frames * L
-    rng = np.random.default_rng(42)
-    cover = rng.standard_normal((n_samples, 1))
+    def _synthetic():
+        L = DEFAULT_FRAME_LEN
+        n_frames = max(8 * len(payload_bytes) + 8, 200)
+        n_samples = n_frames * L
+        rng = np.random.default_rng(42)
+        return rng.standard_normal((n_samples, 1)), 44100
 
-    stego, _ = run_baseline_experiment(cover, fs, message)
+    cover, fs, cover_path = load_cover_audio(args.cover, synthetic_builder=_synthetic)
     out_dir = Path(__file__).resolve().parent / "audio_out"
-    save_audio(out_dir / "demo_stego.wav", stego, fs)
-    print(f"Wrote {out_dir / 'demo_stego.wav'}")
+    stego_path = args.stego_out or (out_dir / "echo_stego.wav")
+
+    stego, _ = run_baseline_experiment(
+        cover,
+        fs,
+        payload_bytes,
+        cover_path=cover_path,
+        stego_path=stego_path,
+        payload_info=pinfo,
+        extracted_path=args.extracted_out,
+    )
+    print(f"Wrote {stego_path}")

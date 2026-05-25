@@ -43,16 +43,25 @@ def save_audio(path: str | Path, data: np.ndarray, fs: int) -> None:
 # Message <-> bits
 # ---------------------------------------------------------------------------
 
+def bytes_to_bits(data: bytes) -> str:
+    """Raw bytes -> binary string (8 bits per byte, MSB first)."""
+    return "".join(format(b, "08b") for b in data)
+
+
+def bits_to_bytes(bits: str) -> bytes:
+    """Binary string -> bytes (ignores incomplete trailing bits)."""
+    n = len(bits) // 8
+    return bytes(int(bits[i * 8 : (i + 1) * 8], 2) for i in range(n))
+
+
 def text_to_bits(text: str) -> str:
     """UTF-8 text -> binary string (8 bits per byte, MSB first)."""
-    return "".join(format(b, "08b") for b in text.encode("utf-8"))
+    return bytes_to_bits(text.encode("utf-8"))
 
 
 def bits_to_text(bits: str) -> str:
     """Binary string -> UTF-8 text (truncates to full bytes only)."""
-    n = len(bits) // 8
-    chars = [chr(int(bits[i * 8 : (i + 1) * 8], 2)) for i in range(n)]
-    return "".join(chars)
+    return bits_to_bytes(bits).decode("utf-8", errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -139,15 +148,15 @@ def extract_bit_from_cepstrum(
 # Public API
 # ---------------------------------------------------------------------------
 
-def embed_message(
+def embed_bytes(
     cover: np.ndarray,
-    text: str,
+    data: bytes,
     frame_len: int = DEFAULT_FRAME_LEN,
     quefrency: int = DEFAULT_QUEFRENCY,
     strength: float = DEFAULT_STRENGTH,
 ) -> np.ndarray:
     """
-    Hide UTF-8 text in non-overlapping frames of the cover audio.
+    Hide raw bytes in non-overlapping frames of the cover audio.
 
     Capacity: one bit per frame -> roughly (len(cover) / frame_len) bits.
     """
@@ -158,7 +167,7 @@ def embed_message(
         mono = np.asarray(cover, dtype=np.float64).copy()
         n_ch = 1
 
-    bits = text_to_bits(text)
+    bits = bytes_to_bits(data)
     n_frames_avail = len(mono) // frame_len
     if len(bits) > n_frames_avail:
         warnings.warn("Message truncated to fit available frames.")
@@ -185,13 +194,24 @@ def embed_message(
     return stego
 
 
-def extract_message(
+def embed_message(
+    cover: np.ndarray,
+    text: str,
+    frame_len: int = DEFAULT_FRAME_LEN,
+    quefrency: int = DEFAULT_QUEFRENCY,
+    strength: float = DEFAULT_STRENGTH,
+) -> np.ndarray:
+    """Hide UTF-8 text (convenience wrapper around embed_bytes)."""
+    return embed_bytes(cover, text.encode("utf-8"), frame_len, quefrency, strength)
+
+
+def extract_bytes(
     stego: np.ndarray,
     frame_len: int = DEFAULT_FRAME_LEN,
     quefrency: int = DEFAULT_QUEFRENCY,
     n_bits: int | None = None,
-) -> str:
-    """Recover bits from cepstral coefficients and decode UTF-8 text."""
+) -> bytes:
+    """Recover raw bytes from cepstral coefficients."""
     if stego.ndim == 2:
         mono = stego[:, 0].astype(np.float64)
     else:
@@ -206,7 +226,18 @@ def extract_message(
         _, _, cepstrum = compute_real_cepstrum(frame)
         bits.append(str(extract_bit_from_cepstrum(cepstrum, quefrency)))
 
-    return bits_to_text("".join(bits))
+    return bits_to_bytes("".join(bits))
+
+
+def extract_message(
+    stego: np.ndarray,
+    frame_len: int = DEFAULT_FRAME_LEN,
+    quefrency: int = DEFAULT_QUEFRENCY,
+    n_bits: int | None = None,
+) -> str:
+    """Recover bits from cepstral coefficients and decode UTF-8 text."""
+    data = extract_bytes(stego, frame_len, quefrency, n_bits=n_bits)
+    return data.decode("utf-8", errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -216,65 +247,121 @@ def extract_message(
 def run_baseline_experiment(
     cover: np.ndarray,
     fs: int,
-    message: str,
+    payload_bytes: bytes,
     frame_len: int = DEFAULT_FRAME_LEN,
     quefrency: int = DEFAULT_QUEFRENCY,
     strength: float = DEFAULT_STRENGTH,
     plot_dir: Path | None = None,
-) -> tuple[np.ndarray, str]:
-    """Embed/extract with timing, BER, plots, and printed analysis notes."""
+    *,
+    cover_path: Path | None = None,
+    stego_path: Path | None = None,
+    payload_info: object | None = None,
+    extracted_path: Path | None = None,
+) -> tuple[np.ndarray, bytes]:
+    """Embed/extract with full evaluation framework (same baseline as LSB/Echo)."""
     from stego_analysis import (
+        PayloadInfo,
         print_analysis_report,
-        print_ber,
-        print_runtime,
-        run_baseline_visualization,
+        resolve_payload,
+        run_full_baseline_evaluation,
+        suggested_extracted_path,
         time_embed_extract,
     )
 
     plot_dir = plot_dir or Path(__file__).resolve().parent / "audio_out" / "analysis" / "cepstrum"
-    n_bits = len(text_to_bits(message))
+    pinfo = (
+        payload_info
+        if isinstance(payload_info, PayloadInfo)
+        else resolve_payload(payload_text=payload_bytes.decode("utf-8", errors="replace"))
+    )
+    n_bits = len(bytes_to_bits(payload_bytes))
     state: dict = {}
 
     def _embed():
-        stego = embed_message(cover.copy(), message, frame_len, quefrency, strength)
+        stego = embed_bytes(cover.copy(), payload_bytes, frame_len, quefrency, strength)
         state["stego"] = stego
         return stego
 
     def _extract():
-        return extract_message(
-            state["stego"], frame_len, quefrency, n_bits=n_bits
-        )
+        return extract_bytes(state["stego"], frame_len, quefrency, n_bits=n_bits)
 
     embed_sec, extract_sec, _, recovered = time_embed_extract(_embed, _extract)
     stego = state["stego"]
 
-    print("\n=== Cepstrum baseline experiment ===")
-    print("Original :", message)
-    print("Recovered:", recovered)
-    print(f"Match    : {message == recovered}")
-    print(f"Frames used: {n_bits} (frame_len={frame_len})")
-    print_ber(message, recovered, to_bits=text_to_bits)
-    print_runtime(embed_sec, extract_sec)
+    if stego_path is not None:
+        save_audio(stego_path, stego, fs)
 
-    run_baseline_visualization(cover, stego, fs, "Cepstrum", plot_dir)
+    out_extract = extracted_path or suggested_extracted_path(
+        "Cepstrum", pinfo, Path(__file__).resolve().parent / "audio_out" / "extracted"
+    )
+
+    print("\n=== Cepstrum baseline experiment ===")
+    print(f"Frames used: {n_bits} (frame_len={frame_len})")
+    run_full_baseline_evaluation(
+        "Cepstrum",
+        cover,
+        stego,
+        fs,
+        payload_bytes,
+        recovered,
+        embed_sec,
+        extract_sec,
+        plot_dir,
+        cover_path=cover_path,
+        stego_path=stego_path,
+        payload_info=pinfo,
+        extracted_path=out_extract,
+    )
     print_analysis_report("Cepstrum")
     return stego, recovered
 
 
 if __name__ == "__main__":
-    fs = 44100
-    duration = 6.0
-    n = int(fs * duration)
-    t = np.arange(n) / fs
-    rng = np.random.default_rng(0)
-    cover = (
-        0.4 * np.sin(2 * np.pi * 440 * t)
-        + 0.1 * np.sin(2 * np.pi * 880 * t)
-        + 0.02 * rng.standard_normal(n)
-    )[:, np.newaxis]
-    message = "Hello cepstrum"
+    import argparse
 
-    stego, _ = run_baseline_experiment(cover, fs, message)
-    out_path = Path(__file__).resolve().parent / "audio_out" / "cepstrum_stego.wav"
-    save_audio(out_path, stego, fs)
-    print(f"Wrote {out_path}")
+    from stego_analysis import (
+        add_experiment_arguments,
+        load_cover_audio,
+        payload_info_to_bytes,
+        resolve_payload,
+    )
+
+    parser = argparse.ArgumentParser(description="Cepstrum steganography demo")
+    add_experiment_arguments(parser)
+    args = parser.parse_args()
+
+    fs = 44100
+
+    def _synthetic():
+        duration = 6.0
+        n = int(fs * duration)
+        t = np.arange(n) / fs
+        rng = np.random.default_rng(0)
+        y = (
+            0.4 * np.sin(2 * np.pi * 440 * t)
+            + 0.1 * np.sin(2 * np.pi * 880 * t)
+            + 0.02 * rng.standard_normal(n)
+        )
+        return y[:, np.newaxis], fs
+
+    cover, fs, cover_path = load_cover_audio(args.cover, synthetic_builder=_synthetic)
+    pinfo = resolve_payload(
+        payload_file=args.payload_file,
+        payload_text=args.payload_text,
+        default_text="Hello cepstrum",
+    )
+    payload_bytes = payload_info_to_bytes(pinfo)
+
+    out_dir = Path(__file__).resolve().parent / "audio_out"
+    stego_path = args.stego_out or (out_dir / "cepstrum_stego.wav")
+
+    stego, _ = run_baseline_experiment(
+        cover,
+        fs,
+        payload_bytes,
+        cover_path=cover_path,
+        stego_path=stego_path,
+        payload_info=pinfo,
+        extracted_path=args.extracted_out,
+    )
+    print(f"Wrote {stego_path}")

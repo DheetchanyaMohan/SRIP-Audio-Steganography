@@ -93,19 +93,33 @@ def embed_message(
     text: str,
     password: str = "password123",
 ) -> None:
-    """
-    Hide text in a 16-bit WAV using LSB substitution + password XOR.
+    """Hide UTF-8 text in a 16-bit WAV (stored as bytes via embed_bytes)."""
+    embed_bytes(wavin, wavout, text.encode("utf-8"), password)
 
-    Layout in PCM samples (0-based indices):
-      [0:8]   control byte (mod 256 of sum of password ASCII)
-      [8:48]  40-bit message length (character count)
-      [48:48+len_msg]  scrambled message bits
-    """
+
+def extract_message(
+    wavin: str | Path,
+    password: str = "password123",
+) -> str:
+    """Recover hidden text from a stego WAV; returns empty string if password/check fails."""
+    data = extract_bytes(wavin, password)
+    return data.decode("utf-8", errors="replace")
+
+
+def embed_bytes(
+    wavin: str | Path,
+    wavout: str | Path,
+    data: bytes,
+    password: str = "password123",
+) -> None:
+    """Hide raw bytes in a 16-bit WAV (length field = byte count)."""
     wavin, wavout = Path(wavin), Path(wavout)
     header, dsize, cover = _read_wav_pcm(wavin)
 
-    # Message -> binary matrix (rows = characters, cols = 8 bits), column-major flatten
-    bin_arr = _decimal_to_bits(np.array([ord(c) for c in text], dtype=np.float64), 8)
+    if not data:
+        raise ValueError("Payload is empty")
+
+    bin_arr = _decimal_to_bits(np.array(list(data), dtype=np.float64), 8)
     m, n = bin_arr.shape
     len_msg = m * n
     length_bits = _decimal_to_bits(np.array([m], dtype=np.float64), 40).reshape(1, -1)
@@ -116,7 +130,6 @@ def embed_message(
     if cover.size < len_msg + 48:
         raise ValueError("Message is too long!")
 
-    # Control field: checksum derived from password
     control = _decimal_to_bits(
         np.array([sum(ord(c) for c in password) % 256], dtype=np.float64), 8
     ).reshape(-1)
@@ -128,11 +141,11 @@ def embed_message(
     _write_wav_pcm(wavout, header, dsize, cover)
 
 
-def extract_message(
+def extract_bytes(
     wavin: str | Path,
     password: str = "password123",
-) -> str:
-    """Recover hidden text from a stego WAV; returns empty string if password/check fails."""
+) -> bytes:
+    """Recover hidden bytes from a stego WAV."""
     wavin = Path(wavin)
     _, _, stego = _read_wav_pcm(wavin)
 
@@ -140,17 +153,16 @@ def extract_message(
     expected = sum(ord(c) for c in password) % 256
     if int(_bits_to_decimal(control.reshape(1, -1))[0]) != expected:
         warnings.warn("Password is wrong or message is corrupted!")
-        return ""
+        return b""
 
     length_bits = _get_lsb(stego[8:48]).reshape(1, -1)
-    num_chars = int(_bits_to_decimal(length_bits)[0])
-    len_bits = num_chars * 8
+    num_bytes = int(_bits_to_decimal(length_bits)[0])
+    len_bits = num_bytes * 8
 
     raw_bits = _get_lsb(stego[48 : 48 + len_bits])
     dat = np.bitwise_xor(raw_bits, _prng(password, len_bits))
-    bin_arr = dat.reshape(num_chars, 8, order="F")
-    chars = _bits_to_decimal(bin_arr).astype(np.uint8)
-    return "".join(chr(c) for c in chars)
+    bin_arr = dat.reshape(num_bytes, 8, order="F")
+    return bytes(_bits_to_decimal(bin_arr).astype(np.uint8))
 
 
 # ---------------------------------------------------------------------------
@@ -160,54 +172,93 @@ def extract_message(
 def run_baseline_experiment(
     cover_path: Path,
     stego_path: Path,
-    message: str,
+    payload_bytes: bytes,
     password: str = "mypassword123",
     plot_dir: Path | None = None,
+    payload_info: object | None = None,
+    extracted_path: Path | None = None,
 ) -> None:
-    """Embed/extract with timing, BER, plots, and printed analysis notes."""
+    """Embed/extract with full evaluation framework."""
     import soundfile as sf
 
     from stego_analysis import (
+        PayloadInfo,
         print_analysis_report,
-        print_ber,
-        print_runtime,
-        run_baseline_visualization,
+        resolve_payload,
+        run_full_baseline_evaluation,
+        suggested_extracted_path,
         time_embed_extract,
     )
 
     plot_dir = plot_dir or Path(__file__).resolve().parent / "audio_out" / "analysis" / "lsb"
+    pinfo = (
+        payload_info
+        if isinstance(payload_info, PayloadInfo)
+        else resolve_payload(payload_text=payload_bytes.decode("utf-8", errors="replace"))
+    )
+    out_extract = extracted_path or suggested_extracted_path(
+        "LSB", pinfo, Path(__file__).resolve().parent / "audio_out" / "extracted"
+    )
 
     embed_sec, extract_sec, _, recovered = time_embed_extract(
-        lambda: embed_message(cover_path, stego_path, message, password),
-        lambda: extract_message(stego_path, password),
+        lambda: embed_bytes(cover_path, stego_path, payload_bytes, password),
+        lambda: extract_bytes(stego_path, password),
     )
 
     cover_f, sr = sf.read(cover_path, dtype="float64", always_2d=True)
     stego_f, _ = sf.read(stego_path, dtype="float64", always_2d=True)
 
     print("\n=== LSB baseline experiment ===")
-    print("Original message:", message)
-    print("Recovered message:", recovered)
-    print_ber(message, recovered)
-    print_runtime(embed_sec, extract_sec)
-
-    run_baseline_visualization(cover_f, stego_f, sr, "LSB", plot_dir)
+    run_full_baseline_evaluation(
+        "LSB",
+        cover_f,
+        stego_f,
+        sr,
+        payload_bytes,
+        recovered,
+        embed_sec,
+        extract_sec,
+        plot_dir,
+        cover_path=cover_path,
+        stego_path=stego_path,
+        payload_info=pinfo,
+        extracted_path=out_extract,
+    )
     print_analysis_report("LSB")
 
 
 if __name__ == "__main__":
+    import argparse
+
     import soundfile as sf
+
+    from stego_analysis import add_experiment_arguments, payload_to_bytes, resolve_payload
+
+    parser = argparse.ArgumentParser(description="LSB audio steganography demo")
+    add_experiment_arguments(parser)
+    parser.add_argument("--password", default="mypassword123")
+    args = parser.parse_args()
 
     out_dir = Path(__file__).resolve().parent / "audio_out"
     out_dir.mkdir(parents=True, exist_ok=True)
-    cover_path = out_dir / "lsb_cover.wav"
-    stego_path = out_dir / "lsb_stego.wav"
-    password = "mypassword123"
-    message = "Text to be hidden"
-    fs = 44100
-    duration = 1.0
-    t = np.arange(int(fs * duration)) / fs
-    tone = (0.4 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
-    sf.write(cover_path, tone, fs, subtype="PCM_16")
+    cover_path = args.cover or (out_dir / "lsb_cover.wav")
+    stego_path = args.stego_out or (out_dir / "lsb_stego.wav")
 
-    run_baseline_experiment(cover_path, stego_path, message, password)
+    if args.cover is None:
+        fs = 44100
+        duration = 1.0
+        t = np.arange(int(fs * duration)) / fs
+        tone = (0.4 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+        sf.write(cover_path, tone, fs, subtype="PCM_16")
+
+    pinfo = resolve_payload(payload_file=args.payload_file, payload_text=args.payload_text)
+    payload_bytes = payload_to_bytes(pinfo)
+
+    run_baseline_experiment(
+        cover_path,
+        stego_path,
+        payload_bytes,
+        args.password,
+        payload_info=pinfo,
+        extracted_path=args.extracted_out,
+    )
