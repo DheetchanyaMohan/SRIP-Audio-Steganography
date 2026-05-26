@@ -261,18 +261,18 @@ METHOD_NOTES: dict[str, dict[str, str]] = {
     },
     "Autoencoder Latent": {
         "observations": (
-            "Secrets are embedded as LSBs on a quantized grid in the pretrained "
-            "ArchiSound latent (autoencoder1d-AT-v1, Tanh bottleneck). "
-            "Waveform quality depends on how many latent scalars are flipped."
+            "Secrets are embedded as LSBs on a coarse quantized grid (default L=16) "
+            "in the ArchiSound latent (autoencoder1d-AT-v1, Tanh bottleneck), with "
+            "5x per-bit repetition and majority-vote extraction. "
+            "Waveform quality remains high because edits are small relative to Tanh range."
         ),
         "limitations": (
-            "Lossy AE: decode(encode(cover)) != cover and encode(stego) != z_embedded; "
-            "BER rises with payload size and low quant_levels. "
-            "Fixed 48 kHz stereo length (default 2**18 samples)."
+            "Lossy AE: encode(stego) drifts from z_embedded; fine quant grids (L>>64) "
+            "collapse BER. Capacity is |z|/5 bits. Fixed 48 kHz stereo length (2**18 samples)."
         ),
         "improvements": (
-            "Spread-spectrum latent indexing, error-correcting codes, "
-            "QIM with calibrated step size, or fine-tuned robust latent stego."
+            "Sparse latent indexing across channels, QIM, or error-correcting codes "
+            "without retraining the AE."
         ),
     },
 }

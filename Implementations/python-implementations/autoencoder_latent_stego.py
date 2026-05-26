@@ -3,23 +3,28 @@ Latent-space audio steganography proof-of-concept (inference-only).
 
 Uses ArchiSound ``autoencoder1d-AT-v1`` (pretrained, ~20M params, Tanh bottleneck).
 
-Embedding strategy (latent LSB on a fixed quantization grid)
-------------------------------------------------------------
+Embedding strategy (coarse-grid LSB + 5x repetition)
+----------------------------------------------------
 Latent ``z`` has shape ``[B, C, T_lat]`` (default ``[1, 32, 8192]`` for 2**18 samples @ 48 kHz).
 
 1. Flatten ``z`` in row-major C-contiguous order: index ``i`` maps to
    channel ``c = i // T_lat``, time ``t = i % T_lat``.
-2. Only the first ``8 * len(payload_bytes)`` indices are modified.
+2. Each payload bit is written ``BIT_REPETITION`` times (default 5) at flat indices
+   ``[i*R, i*R+1, …, i*R+R-1]`` (``R = BIT_REPETITION``).
 3. Each scalar is clamped to ``[-1, 1]`` (Tanh bottleneck range), mapped to an integer
-   ``q in [0, L-1]`` with ``L = quant_levels`` (default 2048).
+   ``q in [0, L-1]`` with ``L = quant_levels`` (default 16 — coarse step ~0.13).
 4. Embed bit ``b``: force ``q' = (q & ~1) | b`` (LSB of ``q``).
 5. Map ``q'`` back to float and write into ``z``.
 
-Extraction reverses step 3–4 on ``z_rec = encode(stego_audio)`` using the same indices.
+Extraction reads the same indices from ``z_rec = encode(stego_audio)`` and applies
+majority vote (``>= 3`` of 5) per bit.
 
-Limitations: the AE is lossy; ``encode(decode(z_embed))`` differs from ``z_embed``, so bits
-are not recovered perfectly. Lower ``quant_levels`` is usually more robust; higher ``L``
-packs bits more densely but is more fragile.
+Why coarse ``L``: AE round-trip drift on embedded coefficients (~0.03 std) is far larger
+than the LSB step at ``L=2048`` (~0.0005), which drives ~50% BER. A coarse grid makes
+the LSB decision margin robust; repetition absorbs residual per-index errors.
+
+Limitations: lossy AE; capacity is ``floor(|z| / R)`` bits. ``--quant-levels`` can be
+tuned (very low ``L`` improves BER, very high ``L`` degrades it).
 """
 
 from __future__ import annotations
@@ -37,7 +42,8 @@ DEFAULT_NUM_SAMPLES = 2**18  # 262144 -> latent time 8192
 LATENT_CHANNELS = 32
 LATENT_MIN = -1.0
 LATENT_MAX = 1.0
-DEFAULT_QUANT_LEVELS = 2048
+DEFAULT_QUANT_LEVELS = 16
+BIT_REPETITION = 5
 METHOD_LABEL = "Autoencoder Latent"
 
 
@@ -57,9 +63,13 @@ def bits_to_bytes(bits: str) -> bytes:
     return bytes(int(bits[i * 8 : (i + 1) * 8], 2) for i in range(n))
 
 
-def latent_capacity_bits(z: np.ndarray) -> int:
-    """Total scalar coefficients in latent tensor."""
-    return int(z.size)
+def latent_capacity_bits(
+    z: np.ndarray,
+    *,
+    repetition: int = BIT_REPETITION,
+) -> int:
+    """Payload bit capacity given ``repetition`` copies per bit."""
+    return int(z.size) // max(1, repetition)
 
 
 def index_to_channel_time(i: int, time_len: int) -> tuple[int, int]:
@@ -90,26 +100,35 @@ def extract_bit_lsb(value: float, quant_levels: int) -> int:
     return q & 1
 
 
+def _repetition_majority(votes: list[int], repetition: int) -> int:
+    """Majority bit from ``repetition`` LSB reads (ties -> 0)."""
+    need = repetition // 2 + 1
+    return 1 if sum(votes) >= need else 0
+
+
 def embed_bits_in_latent(
     z: np.ndarray,
     bits: str,
     *,
     quant_levels: int = DEFAULT_QUANT_LEVELS,
     start_index: int = 0,
+    repetition: int = BIT_REPETITION,
 ) -> np.ndarray:
     """
-    Copy ``z`` and embed ``bits`` into flat indices ``start_index + i``.
+    Copy ``z`` and embed ``bits`` with ``repetition`` LSB copies per bit.
 
-    Modifies latent scalars in place on the returned copy.
+    Bit ``i`` uses flat indices ``start_index + i*repetition + r`` for ``r in 0..R-1``.
     """
     out = np.array(z, dtype=np.float32, copy=True)
     flat = out.reshape(-1)
-    t_lat = out.shape[-1]
-    n = min(len(bits), flat.size - start_index)
+    rep = max(1, repetition)
+    max_bits = (flat.size - start_index) // rep
+    n = min(len(bits), max_bits)
     for i in range(n):
-        flat[start_index + i] = embed_bit_lsb(
-            float(flat[start_index + i]), int(bits[i]), quant_levels
-        )
+        b = int(bits[i])
+        for r in range(rep):
+            idx = start_index + i * rep + r
+            flat[idx] = embed_bit_lsb(float(flat[idx]), b, quant_levels)
     return out
 
 
@@ -119,13 +138,21 @@ def extract_bits_from_latent(
     *,
     quant_levels: int = DEFAULT_QUANT_LEVELS,
     start_index: int = 0,
+    repetition: int = BIT_REPETITION,
 ) -> str:
-    """Read ``n_bits`` from latent using the same LSB rule."""
+    """Read ``n_bits`` via majority vote over ``repetition`` LSB copies per bit."""
     flat = np.asarray(z, dtype=np.float32).reshape(-1)
-    n = min(n_bits, flat.size - start_index)
-    return "".join(
-        str(extract_bit_lsb(float(flat[start_index + i]), quant_levels)) for i in range(n)
-    )
+    rep = max(1, repetition)
+    max_bits = (flat.size - start_index) // rep
+    n = min(n_bits, max_bits)
+    out: list[str] = []
+    for i in range(n):
+        votes = [
+            extract_bit_lsb(float(flat[start_index + i * rep + r]), quant_levels)
+            for r in range(rep)
+        ]
+        out.append(str(_repetition_majority(votes, rep)))
+    return "".join(out)
 
 
 def embed_payload_in_latent(
@@ -151,25 +178,39 @@ def extract_payload_from_latent(
     return bits_to_bytes(bits)[:nbytes]
 
 
-def print_embedding_plan(z: np.ndarray, payload: bytes, quant_levels: int) -> None:
+def print_embedding_plan(
+    z: np.ndarray,
+    payload: bytes,
+    quant_levels: int,
+    *,
+    repetition: int = BIT_REPETITION,
+) -> None:
     """Document which latent coefficients carry the secret."""
     t_lat = z.shape[-1]
     n_bits = len(payload) * 8
-    cap = latent_capacity_bits(z)
+    rep = max(1, repetition)
+    cap_bits = latent_capacity_bits(z, repetition=rep)
+    last_idx = n_bits * rep - 1
     c0, t0 = index_to_channel_time(0, t_lat)
-    c1, t1 = index_to_channel_time(min(n_bits - 1, cap - 1), t_lat)
+    c1, t1 = index_to_channel_time(min(last_idx, z.size - 1), t_lat)
+    step = (LATENT_MAX - LATENT_MIN) / max(1, quant_levels - 1)
     print("\n--- Latent embedding plan ---")
     print(f"Model:              {MODEL_NAME}")
     print(f"Latent shape:       {tuple(z.shape)}  (C={z.shape[1]}, T_lat={t_lat})")
-    print(f"Quant levels (L):   {quant_levels}  (LSB on integer q in [0, L-1])")
-    print(f"Modified indices:   flat[0 : {n_bits}]  (channel-major flatten)")
+    print(f"Quant levels (L):   {quant_levels}  (LSB step ~{step:.4f})")
+    print(f"Bit repetition:     {rep}x majority vote")
+    print(f"Modified indices:   flat[0 : {n_bits * rep}]  ({n_bits} bits x {rep})")
     print(f"Index mapping:      (c, t) = (i // {t_lat}, i % {t_lat})")
     print(f"First coefficient:  index 0 -> channel {c0}, time {t0}")
-    print(f"Last coefficient:   index {n_bits - 1} -> channel {c1}, time {t1}")
+    print(f"Last coefficient:   index {last_idx} -> channel {c1}, time {t1}")
     print(f"Payload bytes:      {len(payload)}  ({n_bits} bits)")
-    print(f"Latent capacity:    {cap} scalars ({cap // 8} bytes if all used)")
     print(
-        "Rule: clamp v in [-1,1] -> q=round(v); q=(q&~1)|bit; v'=dequantize(q')"
+        f"Latent capacity:    {cap_bits} bits "
+        f"({cap_bits // 8} bytes) with {rep}x repetition"
+    )
+    print(
+        "Rule: clamp v in [-1,1] -> q=round(v); q=(q&~1)|bit; v'=dequantize(q'); "
+        f"decode bit by majority over {rep} copies"
     )
 
 
@@ -291,6 +332,36 @@ def model_output_to_numpy(y) -> np.ndarray:
     return y.reshape(-1)
 
 
+def stego_tensor_to_model_input(
+    stego,
+    *,
+    num_samples: int = DEFAULT_NUM_SAMPLES,
+) -> np.ndarray:
+    """
+    Decoder output -> float32 ``[1, 2, T]`` for re-encode (preserve L/R).
+
+    Do not collapse to mono before extraction: ``encode(mono_dup)`` != ``encode(stego)``.
+    """
+    import torch
+
+    if isinstance(stego, torch.Tensor):
+        y = stego.detach().cpu().numpy()
+    else:
+        y = np.asarray(stego, dtype=np.float32)
+    if y.ndim == 3:
+        y = y[0]
+    if y.ndim != 2 or y.shape[0] < 2:
+        raise ValueError(f"Expected stereo [2, T], got shape {y.shape}")
+    n = min(y.shape[1], num_samples)
+    left = y[0, :n]
+    right = y[1, :n]
+    if n < num_samples:
+        left = np.pad(left, (0, num_samples - n))
+        right = np.pad(right, (0, num_samples - n))
+    stereo = np.stack([left, right], axis=0)
+    return stereo[np.newaxis, :, :].astype(np.float32)
+
+
 def prepare_cover_audio(
     audio: np.ndarray,
     sr: int,
@@ -352,7 +423,7 @@ def embed_latent_stego(
     with torch.no_grad():
         z = _tensor_encode(ae, x)
     z_np = latent_to_numpy(z)
-    print_embedding_plan(z_np, payload, quant_levels)
+    print_embedding_plan(z_np, payload, quant_levels, repetition=BIT_REPETITION)
     z_emb_np = embed_payload_in_latent(z_np, payload, quant_levels=quant_levels)
     z_emb = torch.from_numpy(z_emb_np).to(device=device, dtype=z.dtype)
     z_emb = z_emb.reshape(z.shape)
@@ -432,15 +503,17 @@ def run_baseline_experiment(
             device=device,
         )
         state["stego_t"] = stego_t
+        state["stego_model_in"] = stego_tensor_to_model_input(
+            stego_t, num_samples=num_samples
+        )
         state["stego_np"] = model_output_to_numpy(stego_t)
         state["cover_np"] = 0.5 * (cover_in[0, 0] + cover_in[0, 1])
         return stego_t
 
     def _extract():
-        stego_in = numpy_to_model_input(state["stego_np"], num_samples=num_samples)
         recovered, _ = extract_latent_payload(
             ae,
-            stego_in,
+            state["stego_model_in"],
             len(payload_bytes),
             quant_levels=quant_levels,
             device=device,
@@ -501,7 +574,10 @@ if __name__ == "__main__":
         "--quant-levels",
         type=int,
         default=DEFAULT_QUANT_LEVELS,
-        help="Latent quantization levels for LSB embedding (lower=more robust).",
+        help=(
+            "Latent quantization levels for LSB embedding (default 16; "
+            "lower=more robust, higher=fragile after AE round-trip)."
+        ),
     )
     parser.add_argument(
         "--num-samples",
