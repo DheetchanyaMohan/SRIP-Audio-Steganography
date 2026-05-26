@@ -29,6 +29,7 @@ tuned (very low ``L`` improves BER, very high ``L`` degrades it).
 
 from __future__ import annotations
 
+import csv
 import warnings
 from pathlib import Path
 
@@ -45,6 +46,9 @@ LATENT_MAX = 1.0
 DEFAULT_QUANT_LEVELS = 16
 BIT_REPETITION = 5
 METHOD_LABEL = "Autoencoder Latent"
+
+# Payload capacity sweep: usage as % of theoretical max latent bits (|z|/R).
+CAPACITY_SWEEP_LEVELS_PCT = (25, 50, 75, 90, 100)
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +415,7 @@ def embed_latent_stego(
     *,
     quant_levels: int = DEFAULT_QUANT_LEVELS,
     device: str = "cpu",
+    quiet: bool = False,
 ) -> tuple[object, np.ndarray, np.ndarray]:
     """
     cover -> encode -> embed in z -> decode -> stego waveform tensor.
@@ -423,7 +428,8 @@ def embed_latent_stego(
     with torch.no_grad():
         z = _tensor_encode(ae, x)
     z_np = latent_to_numpy(z)
-    print_embedding_plan(z_np, payload, quant_levels, repetition=BIT_REPETITION)
+    if not quiet:
+        print_embedding_plan(z_np, payload, quant_levels, repetition=BIT_REPETITION)
     z_emb_np = embed_payload_in_latent(z_np, payload, quant_levels=quant_levels)
     z_emb = torch.from_numpy(z_emb_np).to(device=device, dtype=z.dtype)
     z_emb = z_emb.reshape(z.shape)
@@ -556,6 +562,307 @@ def run_baseline_experiment(
     return stego_np, recovered
 
 
+def run_capacity_sweep(
+    cover_audio: np.ndarray,
+    sr: int,
+    *,
+    quant_levels: int = DEFAULT_QUANT_LEVELS,
+    num_samples: int = DEFAULT_NUM_SAMPLES,
+    cover_path: Path | None = None,
+    device: str | None = None,
+) -> list[dict[str, float]]:
+    """
+    Sweep payload usage from 25% to 100% of theoretical latent capacity.
+
+    Reuses the current PoC pipeline:
+    cover -> encode -> embed -> decode -> re-encode -> recover -> evaluate.
+    """
+    import torch
+    from stego_analysis import (
+        bit_error_rate_bytes,
+        compute_audio_quality_metrics,
+        format_bytes,
+        time_embed_extract,
+    )
+
+    analysis_dir = (
+        Path(__file__).resolve().parent / "audio_out" / "analysis" / "autoencoder"
+    )
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    sweep_audio_dir = Path(__file__).resolve().parent / "audio_out" / "capacity_sweep"
+    sweep_audio_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = analysis_dir / "capacity_sweep_results.csv"
+
+    ae, device = load_autoencoder(device)
+    cover_in, _ = prepare_cover_audio(
+        cover_audio, sr, num_samples=num_samples, target_sr=SAMPLE_RATE
+    )
+    cover_np = 0.5 * (cover_in[0, 0] + cover_in[0, 1])
+    cover_samples = int(len(cover_np))
+
+    # Use real on-disk WAV sizes for cover/stego growth reporting.
+    cover_ref_path = sweep_audio_dir / "cover_reference.wav"
+    sf.write(cover_ref_path, cover_np, SAMPLE_RATE)
+    cover_size_bytes = (
+        int(Path(cover_path).stat().st_size)
+        if cover_path is not None and Path(cover_path).exists()
+        else int(cover_ref_path.stat().st_size)
+    )
+
+    x = torch.from_numpy(cover_in).to(device)
+    with torch.no_grad():
+        z_cover = _tensor_encode(ae, x)
+    z_cover_np = latent_to_numpy(z_cover)
+    max_payload_bits = latent_capacity_bits(z_cover_np, repetition=BIT_REPETITION)
+
+    results: list[dict[str, float]] = []
+    rng = np.random.default_rng(20260526)
+
+    print("\n=== Autoencoder latent capacity sweep ===")
+    print(f"Latent shape: {tuple(z_cover_np.shape)}")
+    print(
+        f"Theoretical max payload bits: {max_payload_bits} "
+        f"({max_payload_bits // 8} bytes) with {BIT_REPETITION}x repetition"
+    )
+    print(f"Quant levels (L): {quant_levels}")
+
+    for usage_pct in CAPACITY_SWEEP_LEVELS_PCT:
+        target_bits = int(np.floor(max_payload_bits * (usage_pct / 100.0)))
+        payload_bytes_len = max(1, target_bits // 8)
+        payload_bits = payload_bytes_len * 8
+        payload = rng.integers(0, 256, size=payload_bytes_len, dtype=np.uint8).tobytes()
+        stego_path = sweep_audio_dir / f"stego_usage_{usage_pct:03d}.wav"
+        state: dict[str, object] = {}
+
+        def _embed() -> object:
+            stego_t, _, _ = embed_latent_stego(
+                ae,
+                cover_in,
+                payload,
+                quant_levels=quant_levels,
+                device=device,
+                quiet=True,
+            )
+            state["stego_t"] = stego_t
+            state["stego_model_in"] = stego_tensor_to_model_input(
+                stego_t, num_samples=num_samples
+            )
+            state["stego_np"] = model_output_to_numpy(stego_t)
+            return stego_t
+
+        def _extract() -> bytes:
+            recovered, _ = extract_latent_payload(
+                ae,
+                np.asarray(state["stego_model_in"], dtype=np.float32),
+                payload_bytes_len,
+                quant_levels=quant_levels,
+                device=device,
+            )
+            return recovered
+
+        embed_sec, extract_sec, _, recovered = time_embed_extract(_embed, _extract)
+        stego_np = np.asarray(state["stego_np"], dtype=np.float64)
+        sf.write(stego_path, stego_np, SAMPLE_RATE)
+        stego_size_bytes = int(stego_path.stat().st_size)
+        size_growth_bytes = stego_size_bytes - cover_size_bytes
+        size_growth_pct = (
+            100.0 * size_growth_bytes / cover_size_bytes if cover_size_bytes > 0 else 0.0
+        )
+
+        ber_pct = bit_error_rate_bytes(payload, recovered)
+        bit_errors = int(round(ber_pct * payload_bits / 100.0)) if payload_bits else 0
+        extracted_ok = int(recovered == payload)
+        quality = compute_audio_quality_metrics(
+            cover_np[:, np.newaxis], stego_np[:, np.newaxis], SAMPLE_RATE
+        )
+
+        payload_usage_pct = 100.0 * payload_bits / max_payload_bits
+        payload_cover_ratio_pct = (
+            100.0 * payload_bytes_len / cover_size_bytes if cover_size_bytes > 0 else 0.0
+        )
+        bps = payload_bits / cover_samples if cover_samples > 0 else 0.0
+        runtime_total_sec = embed_sec + extract_sec
+
+        row = {
+            "usage_target_pct": float(usage_pct),
+            "usage_actual_pct": float(payload_usage_pct),
+            "cover_samples": float(cover_samples),
+            "cover_size_bytes": float(cover_size_bytes),
+            "payload_size_bytes": float(payload_bytes_len),
+            "payload_bits": float(payload_bits),
+            "max_payload_bits": float(max_payload_bits),
+            "payload_cover_ratio_pct": float(payload_cover_ratio_pct),
+            "bits_per_sample": float(bps),
+            "stego_size_bytes": float(stego_size_bytes),
+            "stego_growth_bytes": float(size_growth_bytes),
+            "stego_growth_pct": float(size_growth_pct),
+            "embed_sec": float(embed_sec),
+            "extract_sec": float(extract_sec),
+            "total_sec": float(runtime_total_sec),
+            "ber_pct": float(ber_pct),
+            "bit_errors": float(bit_errors),
+            "extracted_success": float(extracted_ok),
+            "psnr_db": float(quality["psnr_db"]),
+            "thd_stego_pct": float(quality["thd_stego_pct"]),
+            "imd_stego_pct": float(quality["imd_stego_pct"]),
+            "odg_approx": float(quality["odg_approx"]),
+            "peaq_quality_approx": float(quality["peaq_quality_approx"]),
+            "correlation": float(quality["correlation"]),
+            "snr_db": float(quality["snr_db"]),
+            "lsd_db": float(quality["lsd_db"]),
+            "seaq_score": float(quality["seaq_score"]),
+        }
+        results.append(row)
+
+        print(f"\n=== Capacity level: {usage_pct}% (actual {payload_usage_pct:.2f}%) ===")
+        print("Capacity info:")
+        print(f"  cover size:               {cover_size_bytes} B ({cover_size_bytes/1024:.2f} KB)")
+        print(f"  number of audio samples:  {cover_samples}")
+        print(f"  payload size:             {payload_bytes_len} B ({payload_bytes_len/1024:.2f} KB)")
+        print(f"  payload bits:             {payload_bits}")
+        print(f"  theoretical max bits:     {max_payload_bits}")
+        print(f"  payload usage:            {payload_usage_pct:.2f}%")
+        print(f"  payload:cover ratio:      {payload_cover_ratio_pct:.4f}%")
+        print(f"  bits per sample (bps):    {bps:.6f}")
+
+        print("File sizes:")
+        print(f"  cover audio size:         {cover_size_bytes} B ({cover_size_bytes/1024:.2f} KB)")
+        print(f"  stego audio size:         {stego_size_bytes} B ({stego_size_bytes/1024:.2f} KB)")
+        print(f"  stego growth:             {size_growth_bytes:+d} B ({size_growth_pct:+.4f}%)")
+
+        print("Runtime:")
+        print(f"  embedding time:           {embed_sec*1000.0:.2f} ms")
+        print(f"  extraction time:          {extract_sec*1000.0:.2f} ms")
+        print(f"  total runtime:            {runtime_total_sec*1000.0:.2f} ms")
+
+        print("Recovery:")
+        print(f"  BER:                      {ber_pct:.4f}%")
+        print(f"  bit errors:               {bit_errors} / {payload_bits}")
+        print(f"  extracted payload success:{' yes' if extracted_ok else ' no'}")
+
+        print("Audio quality:")
+        print(f"  PSNR:                     {quality['psnr_db']:.4f} dB")
+        print(f"  THD (stego):              {quality['thd_stego_pct']:.6f} %")
+        print(f"  IMD (stego):              {quality['imd_stego_pct']:.6f} %")
+        print(f"  ODG (approx):             {quality['odg_approx']:.4f}")
+        print(f"  PEAQ quality (approx):    {quality['peaq_quality_approx']:.6f}")
+        print(f"  correlation coefficient:  {quality['correlation']:.6f}")
+        print(f"  SNR:                      {quality['snr_db']:.4f} dB")
+        print(f"  LSD:                      {quality['lsd_db']:.4f} dB")
+        print(f"  SEAQ:                     {quality['seaq_score']:.4f}")
+
+    headers = [
+        "Usage",
+        "Payload",
+        "Ratio",
+        "BPS",
+        "BER",
+        "PSNR",
+        "Corr",
+        "Runtime",
+    ]
+    line = "|" + "|".join(f" {h:^10} " for h in headers) + "|"
+    sep = "|" + "|".join("-" * 12 for _ in headers) + "|"
+    print("\n--- Capacity sweep summary ---")
+    print(line)
+    print(sep)
+    for r in results:
+        print(
+            "|"
+            f" {r['usage_actual_pct']:>9.2f}% "
+            "|"
+            f" {format_bytes(int(r['payload_size_bytes'])):>10} "
+            "|"
+            f" {r['payload_cover_ratio_pct']:>9.3f}% "
+            "|"
+            f" {r['bits_per_sample']:>10.4f} "
+            "|"
+            f" {r['ber_pct']:>9.4f}% "
+            "|"
+            f" {r['psnr_db']:>8.2f}dB "
+            "|"
+            f" {r['correlation']:>10.6f} "
+            "|"
+            f" {r['total_sec']*1000.0:>8.1f}ms "
+            "|"
+        )
+
+    csv_fields = [
+        "usage_target_pct",
+        "usage_actual_pct",
+        "cover_size_bytes",
+        "cover_samples",
+        "payload_size_bytes",
+        "payload_bits",
+        "max_payload_bits",
+        "payload_cover_ratio_pct",
+        "bits_per_sample",
+        "stego_size_bytes",
+        "stego_growth_bytes",
+        "stego_growth_pct",
+        "embed_sec",
+        "extract_sec",
+        "total_sec",
+        "ber_pct",
+        "bit_errors",
+        "extracted_success",
+        "psnr_db",
+        "thd_stego_pct",
+        "imd_stego_pct",
+        "odg_approx",
+        "peaq_quality_approx",
+        "correlation",
+        "snr_db",
+        "lsd_db",
+        "seaq_score",
+    ]
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_fields)
+        writer.writeheader()
+        for r in results:
+            writer.writerow(r)
+    print(f"\nSaved CSV: {csv_path}")
+
+    ber_trend = ", ".join(
+        f"{int(r['usage_target_pct'])}%: {r['ber_pct']:.3f}%" for r in results
+    )
+    first_ber_degrade = next((r for r in results if r["ber_pct"] > 0.0), None)
+    degrade_label = (
+        f"{int(first_ber_degrade['usage_target_pct'])}%"
+        if first_ber_degrade is not None
+        else "No BER degradation in tested range"
+    )
+    baseline_psnr = results[0]["psnr_db"]
+    first_quality_degrade = next(
+        (r for r in results if (baseline_psnr - r["psnr_db"]) > 2.0), None
+    )
+    quality_label = (
+        f"{int(first_quality_degrade['usage_target_pct'])}%"
+        if first_quality_degrade is not None
+        else "No >2 dB PSNR drop in tested range"
+    )
+    if first_ber_degrade is None and first_quality_degrade is None:
+        fail_first = "Neither recovery nor reconstruction failed noticeably."
+    elif first_ber_degrade is None:
+        fail_first = "Reconstruction quality degraded before recovery."
+    elif first_quality_degrade is None:
+        fail_first = "Recovery stayed stable before quality degradation."
+    else:
+        fail_first = (
+            "Recovery failed first."
+            if first_ber_degrade["usage_target_pct"]
+            < first_quality_degrade["usage_target_pct"]
+            else "Reconstruction quality degraded first."
+        )
+
+    print("\n--- Capacity sweep conclusions ---")
+    print(f"1) BER trend across capacity: {ber_trend}")
+    print(f"2) Payload level where BER begins degrading: {degrade_label}")
+    print(f"3) Which fails first (recovery vs quality): {fail_first}")
+    print(f"   Quality degradation threshold used: >2 dB PSNR drop (first at {quality_label}).")
+    return results
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -591,6 +898,11 @@ if __name__ == "__main__":
         default=None,
         help="torch device (default: cuda if available else cpu).",
     )
+    parser.add_argument(
+        "--capacity-sweep",
+        action="store_true",
+        help="Run payload-capacity sweep (25/50/75/90/100% latent usage).",
+    )
     args = parser.parse_args()
 
     def _synthetic():
@@ -599,31 +911,40 @@ if __name__ == "__main__":
         return tone[:, np.newaxis], SAMPLE_RATE
 
     cover, sr, cover_path = load_cover_audio(args.cover, synthetic_builder=_synthetic)
-    pinfo = resolve_payload(
-        payload_file=args.payload_file,
-        payload_text=args.payload_text,
-        default_text="Hidden in ArchiSound latent",
-    )
-    payload_bytes = payload_info_to_bytes(pinfo)
-
     out_dir = Path(__file__).resolve().parent / "audio_out"
     out_dir.mkdir(parents=True, exist_ok=True)
     stego_path = args.stego_out or (out_dir / "autoencoder_latent_stego.wav")
 
     try:
-        stego, _ = run_baseline_experiment(
-            cover,
-            sr,
-            payload_bytes,
-            quant_levels=args.quant_levels,
-            num_samples=args.num_samples,
-            cover_path=cover_path,
-            stego_path=stego_path,
-            payload_info=pinfo,
-            extracted_path=args.extracted_out,
-            device=args.device,
-        )
-        print(f"Wrote {stego_path}")
+        if args.capacity_sweep:
+            run_capacity_sweep(
+                cover,
+                sr,
+                quant_levels=args.quant_levels,
+                num_samples=args.num_samples,
+                cover_path=cover_path,
+                device=args.device,
+            )
+        else:
+            pinfo = resolve_payload(
+                payload_file=args.payload_file,
+                payload_text=args.payload_text,
+                default_text="Hidden in ArchiSound latent",
+            )
+            payload_bytes = payload_info_to_bytes(pinfo)
+            stego, _ = run_baseline_experiment(
+                cover,
+                sr,
+                payload_bytes,
+                quant_levels=args.quant_levels,
+                num_samples=args.num_samples,
+                cover_path=cover_path,
+                stego_path=stego_path,
+                payload_info=pinfo,
+                extracted_path=args.extracted_out,
+                device=args.device,
+            )
+            print(f"Wrote {stego_path}")
     except ImportError as err:
         print(f"ERROR: {err}")
         raise SystemExit(1) from err
