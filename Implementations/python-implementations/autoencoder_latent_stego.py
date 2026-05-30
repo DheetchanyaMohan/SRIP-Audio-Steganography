@@ -50,6 +50,10 @@ METHOD_LABEL = "Autoencoder Latent"
 # Payload capacity sweep: usage as % of theoretical max latent bits (|z|/R).
 CAPACITY_SWEEP_LEVELS_PCT = (25, 50, 75, 90, 100)
 
+# Benchmark-audio suite: low-to-moderate latent usage per file.
+BENCHMARK_USAGE_LEVELS_PCT = (1, 2, 5, 10, 15, 20, 25)
+BENCHMARK_AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac"}
+
 
 # ---------------------------------------------------------------------------
 # Latent LSB helpers
@@ -454,6 +458,512 @@ def extract_latent_payload(
         z = _tensor_encode(ae, x)
     z_np = latent_to_numpy(z)
     return extract_payload_from_latent(z_np, nbytes, quant_levels=quant_levels), z_np
+
+
+# ---------------------------------------------------------------------------
+# Benchmark-audio discovery + suite
+# ---------------------------------------------------------------------------
+
+
+def _script_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def default_benchmark_search_roots() -> list[Path]:
+    """Candidate folders for benchmark audio (first existing wins per file)."""
+    root = _script_root()
+    repo = root.parent
+    return [
+        root / "audiosamples",
+        repo / "audiosamples",
+        root / "benchmark-audio",
+        repo / "benchmark-audio",
+        root / "audios",
+        repo / "audios",
+    ]
+
+
+def discover_benchmark_audio_files(
+    search_roots: list[Path] | None = None,
+) -> list[Path]:
+    """
+    Recursively collect ``.wav``, ``.mp3``, ``.flac`` under benchmark folders.
+
+    Searches ``audiosamples``, ``benchmark-audio``, and ``audios/`` (see
+    ``default_benchmark_search_roots``). De-duplicates by resolved path.
+    """
+    roots = search_roots or default_benchmark_search_roots()
+    found: dict[str, Path] = {}
+    for base in roots:
+        if not base.is_dir():
+            continue
+        for ext in BENCHMARK_AUDIO_EXTENSIONS:
+            for path in base.rglob(f"*{ext}"):
+                if path.is_file():
+                    found[str(path.resolve())] = path.resolve()
+    return sorted(found.values(), key=lambda p: p.name.lower())
+
+
+def _infer_audio_category(path: Path) -> str:
+    """Heuristic label from path/name: speech, music, transient, or general."""
+    name = f"{path.parent.name}/{path.name}".lower()
+    if any(k in name for k in ("speech", "voice", "vocal", "talk", "dialog")):
+        return "speech"
+    if any(k in name for k in ("drum", "perc", "click", "transient", "impact", "snare")):
+        return "transient"
+    if any(
+        k in name
+        for k in ("music", "song", "piano", "guitar", "orchestra", "melody", "chord")
+    ):
+        return "music"
+    return "general"
+
+
+def load_benchmark_audio_file(path: Path) -> tuple[np.ndarray, int, str]:
+    """
+    Load benchmark file as float64 ``[T, C]``.
+
+    Returns ``(audio, sample_rate, channels_label)`` with channels_label
+    ``mono`` or ``stereo``.
+    """
+    path = Path(path)
+    ext = path.suffix.lower()
+    try:
+        data, sr = sf.read(path, dtype="float64", always_2d=True)
+    except Exception:
+        if ext == ".mp3":
+            import librosa
+
+            y, sr = librosa.load(str(path), sr=None, mono=False)
+            if y.ndim == 1:
+                data = y[:, np.newaxis]
+            else:
+                data = y.T
+            data = np.asarray(data, dtype=np.float64)
+        else:
+            raise
+    channels = "stereo" if data.shape[1] >= 2 else "mono"
+    return data, int(sr), channels
+
+
+def _payload_seed(audio_path: Path, usage_pct: int) -> int:
+    return hash((str(audio_path.resolve()), usage_pct)) & 0xFFFFFFFF
+
+
+def _run_benchmark_trial(
+    ae,
+    *,
+    cover_in: np.ndarray,
+    cover_np: np.ndarray,
+    cover_samples: int,
+    cover_size_bytes: int,
+    max_payload_bits: int,
+    usage_pct: int,
+    audio_path: Path,
+    quant_levels: int,
+    num_samples: int,
+    device: str,
+) -> tuple[dict[str, float | str], np.ndarray]:
+    """Single (audio, usage level) embed/extract/evaluate; returns row + stego mono."""
+    from stego_analysis import (
+        bit_error_rate_bytes,
+        compute_audio_quality_metrics,
+        time_embed_extract,
+    )
+
+    target_bits = max(1, int(np.floor(max_payload_bits * (usage_pct / 100.0))))
+    payload_bytes_len = max(1, target_bits // 8)
+    payload_bits = payload_bytes_len * 8
+    rng = np.random.default_rng(_payload_seed(audio_path, usage_pct))
+    payload = rng.integers(0, 256, size=payload_bytes_len, dtype=np.uint8).tobytes()
+    state: dict[str, object] = {}
+
+    def _embed() -> object:
+        stego_t, _, _ = embed_latent_stego(
+            ae,
+            cover_in,
+            payload,
+            quant_levels=quant_levels,
+            device=device,
+            quiet=True,
+        )
+        state["stego_model_in"] = stego_tensor_to_model_input(
+            stego_t, num_samples=num_samples
+        )
+        state["stego_np"] = model_output_to_numpy(stego_t)
+        return stego_t
+
+    def _extract() -> bytes:
+        recovered, _ = extract_latent_payload(
+            ae,
+            np.asarray(state["stego_model_in"], dtype=np.float32),
+            payload_bytes_len,
+            quant_levels=quant_levels,
+            device=device,
+        )
+        return recovered
+
+    embed_sec, extract_sec, _, recovered = time_embed_extract(_embed, _extract)
+    stego_np = np.asarray(state["stego_np"], dtype=np.float64)
+
+    ber_pct = bit_error_rate_bytes(payload, recovered)
+    bit_errors = int(round(ber_pct * payload_bits / 100.0)) if payload_bits else 0
+    extracted_ok = int(recovered == payload)
+    quality = compute_audio_quality_metrics(
+        cover_np[:, np.newaxis], stego_np[:, np.newaxis], SAMPLE_RATE
+    )
+    payload_usage_pct = 100.0 * payload_bits / max_payload_bits
+    payload_cover_ratio_pct = (
+        100.0 * payload_bytes_len / cover_size_bytes if cover_size_bytes > 0 else 0.0
+    )
+    bps = payload_bits / cover_samples if cover_samples > 0 else 0.0
+
+    row: dict[str, float | str] = {
+        "filename": audio_path.name,
+        "audio_path": str(audio_path),
+        "audio_category": _infer_audio_category(audio_path),
+        "duration_sec": float(len(cover_np) / SAMPLE_RATE),
+        "sample_rate": float(SAMPLE_RATE),
+        "channels": "mono",
+        "cover_size_bytes": float(cover_size_bytes),
+        "num_samples": float(cover_samples),
+        "usage_target_pct": float(usage_pct),
+        "usage_actual_pct": float(payload_usage_pct),
+        "payload_size_bytes": float(payload_bytes_len),
+        "payload_bits": float(payload_bits),
+        "max_payload_bits": float(max_payload_bits),
+        "payload_cover_ratio_pct": float(payload_cover_ratio_pct),
+        "bits_per_sample": float(bps),
+        "embed_sec": float(embed_sec),
+        "extract_sec": float(extract_sec),
+        "total_sec": float(embed_sec + extract_sec),
+        "ber_pct": float(ber_pct),
+        "bit_errors": float(bit_errors),
+        "extracted_success": float(extracted_ok),
+        "psnr_db": float(quality["psnr_db"]),
+        "thd_stego_pct": float(quality["thd_stego_pct"]),
+        "imd_stego_pct": float(quality["imd_stego_pct"]),
+        "odg_approx": float(quality["odg_approx"]),
+        "peaq_quality_approx": float(quality["peaq_quality_approx"]),
+        "correlation": float(quality["correlation"]),
+        "snr_db": float(quality["snr_db"]),
+        "lsd_db": float(quality["lsd_db"]),
+        "seaq_score": float(quality["seaq_score"]),
+    }
+    return row, stego_np
+
+
+def run_benchmark_audio_suite(
+    *,
+    search_roots: list[Path] | None = None,
+    quant_levels: int = DEFAULT_QUANT_LEVELS,
+    num_samples: int = DEFAULT_NUM_SAMPLES,
+    device: str | None = None,
+) -> list[dict[str, float | str]]:
+    """
+  Run latent stego on every benchmark audio × usage level (1–25%).
+
+  Saves ``audio_out/analysis/autoencoder/benchmark_audio_results.csv`` and
+  waveform/spectrogram plots for best and worst BER cases.
+  """
+    import os
+
+    import torch
+
+    os.environ.setdefault("MPLBACKEND", "Agg")
+    from stego_analysis import format_bytes, run_baseline_visualization
+
+    analysis_dir = _script_root() / "audio_out" / "analysis" / "autoencoder"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = analysis_dir / "benchmark_audio_results.csv"
+    plot_dir = analysis_dir / "benchmark_suite"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    audio_files = discover_benchmark_audio_files(search_roots)
+    roots = search_roots or default_benchmark_search_roots()
+    existing_roots = [r for r in roots if r.is_dir()]
+
+    print("\n=== Autoencoder latent benchmark-audio suite ===")
+    print(f"Quant levels (L): {quant_levels}, repetition: {BIT_REPETITION}x")
+    print(f"Usage levels (% of max latent bits): {BENCHMARK_USAGE_LEVELS_PCT}")
+    if existing_roots:
+        print("Search roots:")
+        for r in existing_roots:
+            print(f"  - {r}")
+    else:
+        print("Search roots (none found on disk):")
+        for r in roots:
+            print(f"  - {r}")
+
+    if not audio_files:
+        print(
+            "\nNo benchmark audio files found. Add .wav/.mp3/.flac under "
+            "audiosamples/ or audios/ (recursive)."
+        )
+        return []
+
+    print(f"Found {len(audio_files)} audio file(s).")
+
+    ae, device = load_autoencoder(device)
+    results: list[dict[str, float | str]] = []
+    best_case: dict[str, object] | None = None
+    worst_case: dict[str, object] | None = None
+
+    for audio_path in audio_files:
+        try:
+            cover_audio, file_sr, channels = load_benchmark_audio_file(audio_path)
+            file_size = int(audio_path.stat().st_size)
+            duration_sec = float(len(cover_audio) / file_sr) if file_sr > 0 else 0.0
+
+            cover_in, _ = prepare_cover_audio(
+                cover_audio, file_sr, num_samples=num_samples, target_sr=SAMPLE_RATE
+            )
+            cover_np = 0.5 * (cover_in[0, 0] + cover_in[0, 1])
+            cover_samples = int(len(cover_np))
+
+            x = torch.from_numpy(cover_in).to(device)
+            with torch.no_grad():
+                z_cover = latent_to_numpy(_tensor_encode(ae, x))
+            max_payload_bits = latent_capacity_bits(z_cover, repetition=BIT_REPETITION)
+
+            print(
+                f"\n--- {audio_path.name} ({channels}, {duration_sec:.2f}s, "
+                f"{format_bytes(file_size)}) ---"
+            )
+
+            for usage_pct in BENCHMARK_USAGE_LEVELS_PCT:
+                row, stego_np = _run_benchmark_trial(
+                    ae,
+                    cover_in=cover_in,
+                    cover_np=cover_np,
+                    cover_samples=cover_samples,
+                    cover_size_bytes=file_size,
+                    max_payload_bits=max_payload_bits,
+                    usage_pct=usage_pct,
+                    audio_path=audio_path,
+                    quant_levels=quant_levels,
+                    num_samples=num_samples,
+                    device=device,
+                )
+                row["channels"] = channels
+                row["duration_sec"] = duration_sec
+                row["sample_rate"] = float(file_sr)
+                results.append(row)
+
+                ber = float(row["ber_pct"])
+                case = {
+                    "row": row,
+                    "cover_np": cover_np.copy(),
+                    "stego_np": stego_np.copy(),
+                }
+                if best_case is None or ber < float(best_case["row"]["ber_pct"]):
+                    best_case = case
+                if worst_case is None or ber > float(worst_case["row"]["ber_pct"]):
+                    worst_case = case
+
+        except Exception as exc:
+            warnings.warn(f"Skipping {audio_path}: {exc}")
+
+    if not results:
+        print("\nNo successful benchmark runs.")
+        return []
+
+    csv_fields = [
+        "filename",
+        "audio_path",
+        "audio_category",
+        "duration_sec",
+        "sample_rate",
+        "channels",
+        "cover_size_bytes",
+        "num_samples",
+        "usage_target_pct",
+        "usage_actual_pct",
+        "payload_size_bytes",
+        "payload_bits",
+        "max_payload_bits",
+        "payload_cover_ratio_pct",
+        "bits_per_sample",
+        "embed_sec",
+        "extract_sec",
+        "total_sec",
+        "ber_pct",
+        "bit_errors",
+        "extracted_success",
+        "psnr_db",
+        "thd_stego_pct",
+        "imd_stego_pct",
+        "odg_approx",
+        "peaq_quality_approx",
+        "correlation",
+        "snr_db",
+        "lsd_db",
+        "seaq_score",
+    ]
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_fields)
+        writer.writeheader()
+        for r in results:
+            writer.writerow({k: r[k] for k in csv_fields})
+
+    print(f"\nSaved CSV: {csv_path}")
+
+    # Per-file summary table
+    headers = ["File", "Cat", "Usage", "BER", "PSNR", "Corr", "OK", "Runtime"]
+    line = "|" + "|".join(f" {h:^8} " for h in headers) + "|"
+    sep = "|" + "|".join("-" * 10 for _ in headers) + "|"
+    print("\n--- Benchmark runs (all audio × usage) ---")
+    print(line)
+    print(sep)
+    for r in results:
+        ok = "yes" if int(float(r["extracted_success"])) else "no"
+        print(
+            "|"
+            f" {str(r['filename'])[:8]:^8} "
+            "|"
+            f" {str(r['audio_category'])[:8]:^8} "
+            "|"
+            f" {float(r['usage_target_pct']):>6.0f}% "
+            "|"
+            f" {float(r['ber_pct']):>7.3f}% "
+            "|"
+            f" {float(r['psnr_db']):>6.1f} "
+            "|"
+            f" {float(r['correlation']):>6.4f} "
+            "|"
+            f" {ok:^8} "
+            "|"
+            f" {float(r['total_sec'])*1000:>6.0f}ms "
+            "|"
+        )
+
+    # Averages per usage level
+    print("\n--- Average metrics per payload usage level ---")
+    avg_headers = ["Usage", "Avg BER", "Avg PSNR", "Avg Corr", "Runs"]
+    avg_line = "|" + "|".join(f" {h:^10} " for h in avg_headers) + "|"
+    avg_sep = "|" + "|".join("-" * 12 for _ in avg_headers) + "|"
+    print(avg_line)
+    print(avg_sep)
+    for usage in BENCHMARK_USAGE_LEVELS_PCT:
+        subset = [r for r in results if int(float(r["usage_target_pct"])) == usage]
+        if not subset:
+            continue
+        avg_ber = float(np.mean([float(r["ber_pct"]) for r in subset]))
+        avg_psnr = float(np.mean([float(r["psnr_db"]) for r in subset]))
+        avg_corr = float(np.mean([float(r["correlation"]) for r in subset]))
+        print(
+            "|"
+            f" {usage:>8}% "
+            "|"
+            f" {avg_ber:>9.4f}% "
+            "|"
+            f" {avg_psnr:>8.2f} dB "
+            "|"
+            f" {avg_corr:>10.6f} "
+            "|"
+            f" {len(subset):>10} "
+            "|"
+        )
+
+    best_row = best_case["row"] if best_case else None
+    worst_row = worst_case["row"] if worst_case else None
+    if best_row is not None:
+        print(
+            f"\nBest BER:  {best_row['ber_pct']:.4f}% — "
+            f"{best_row['filename']} @ {best_row['usage_target_pct']:.0f}% usage"
+        )
+    if worst_row is not None:
+        print(
+            f"Worst BER: {worst_row['ber_pct']:.4f}% — "
+            f"{worst_row['filename']} @ {worst_row['usage_target_pct']:.0f}% usage"
+        )
+
+    # Category breakdown
+    print("\n--- Average BER by inferred audio category ---")
+    categories = sorted({str(r["audio_category"]) for r in results})
+    cat_line = "|" + "|".join(f" {h:^12} " for h in ["Category", "Avg BER", "Avg PSNR", "N"]) + "|"
+    cat_sep = "|" + "|".join("-" * 14 for _ in range(4)) + "|"
+    print(cat_line)
+    print(cat_sep)
+    category_notes: list[str] = []
+    for cat in categories:
+        subset = [r for r in results if str(r["audio_category"]) == cat]
+        avg_ber = float(np.mean([float(r["ber_pct"]) for r in subset]))
+        avg_psnr = float(np.mean([float(r["psnr_db"]) for r in subset]))
+        print(
+            "|"
+            f" {cat:^12} "
+            "|"
+            f" {avg_ber:>10.4f}% "
+            "|"
+            f" {avg_psnr:>10.2f} dB "
+            "|"
+            f" {len(subset):>12} "
+            "|"
+        )
+        category_notes.append(f"{cat}: BER={avg_ber:.3f}%")
+
+    if len(categories) > 1:
+        bers = {
+            c: float(np.mean([float(r["ber_pct"]) for r in results if r["audio_category"] == c]))
+            for c in categories
+        }
+        spread = max(bers.values()) - min(bers.values())
+        if spread > 5.0:
+            print(
+                "\nCategory behavior: inferred categories differ in recovery "
+                f"(BER spread {spread:.2f} pp). Check path/folder naming for labels."
+            )
+        else:
+            print(
+                "\nCategory behavior: no strong difference between inferred "
+                f"speech/music/transient labels (BER spread {spread:.2f} pp)."
+            )
+    else:
+        print(
+            "\nCategory behavior: only one category detected; rename or organize "
+            "benchmark folders (speech/, music/, drum/, etc.) for comparisons."
+        )
+
+    # Plots for best / worst BER
+    if best_case is not None:
+        br = best_case["row"]
+        tag = (
+            f"best_ber_{Path(str(br['filename'])).stem}_"
+            f"u{int(float(br['usage_target_pct']))}"
+        )
+        cover_m = np.asarray(best_case["cover_np"], dtype=np.float64)[:, np.newaxis]
+        stego_m = np.asarray(best_case["stego_np"], dtype=np.float64)[:, np.newaxis]
+        run_baseline_visualization(
+            cover_m,
+            stego_m,
+            SAMPLE_RATE,
+            tag,
+            plot_dir,
+        )
+        plot_tag = tag.lower().replace(" ", "_")
+        print(f"Saved best-BER plots: {plot_dir / f'{plot_tag}_waveform.png'}")
+
+    if worst_case is not None:
+        wr = worst_case["row"]
+        tag = (
+            f"worst_ber_{Path(str(wr['filename'])).stem}_"
+            f"u{int(float(wr['usage_target_pct']))}"
+        )
+        cover_m = np.asarray(worst_case["cover_np"], dtype=np.float64)[:, np.newaxis]
+        stego_m = np.asarray(worst_case["stego_np"], dtype=np.float64)[:, np.newaxis]
+        run_baseline_visualization(
+            cover_m,
+            stego_m,
+            SAMPLE_RATE,
+            tag,
+            plot_dir,
+        )
+        plot_tag = tag.lower().replace(" ", "_")
+        print(f"Saved worst-BER plots: {plot_dir / f'{plot_tag}_waveform.png'}")
+
+    print("\n--- Benchmark suite complete ---")
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -903,6 +1413,20 @@ if __name__ == "__main__":
         action="store_true",
         help="Run payload-capacity sweep (25/50/75/90/100% latent usage).",
     )
+    parser.add_argument(
+        "--benchmark-suite",
+        action="store_true",
+        help=(
+            "Run benchmark-audio suite on audiosamples/ or audios/ "
+            "(1/2/5/10/15/20/25%% latent usage per file)."
+        ),
+    )
+    parser.add_argument(
+        "--benchmark-dir",
+        type=Path,
+        default=None,
+        help="Optional root folder for benchmark audio (recursive .wav/.mp3/.flac).",
+    )
     args = parser.parse_args()
 
     def _synthetic():
@@ -910,13 +1434,26 @@ if __name__ == "__main__":
         tone = 0.35 * np.sin(2 * np.pi * 440 * t) + 0.1 * np.sin(2 * np.pi * 880 * t)
         return tone[:, np.newaxis], SAMPLE_RATE
 
-    cover, sr, cover_path = load_cover_audio(args.cover, synthetic_builder=_synthetic)
     out_dir = Path(__file__).resolve().parent / "audio_out"
     out_dir.mkdir(parents=True, exist_ok=True)
     stego_path = args.stego_out or (out_dir / "autoencoder_latent_stego.wav")
 
     try:
-        if args.capacity_sweep:
+        if args.benchmark_suite and args.capacity_sweep:
+            print("ERROR: Use only one of --benchmark-suite or --capacity-sweep.")
+            raise SystemExit(2)
+        if args.benchmark_suite:
+            search_roots = [args.benchmark_dir] if args.benchmark_dir else None
+            run_benchmark_audio_suite(
+                search_roots=search_roots,
+                quant_levels=args.quant_levels,
+                num_samples=args.num_samples,
+                device=args.device,
+            )
+        elif args.capacity_sweep:
+            cover, sr, cover_path = load_cover_audio(
+                args.cover, synthetic_builder=_synthetic
+            )
             run_capacity_sweep(
                 cover,
                 sr,
@@ -926,6 +1463,9 @@ if __name__ == "__main__":
                 device=args.device,
             )
         else:
+            cover, sr, cover_path = load_cover_audio(
+                args.cover, synthetic_builder=_synthetic
+            )
             pinfo = resolve_payload(
                 payload_file=args.payload_file,
                 payload_text=args.payload_text,
